@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import yaml
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 import numpy as np
 from sqlalchemy import create_engine, text
@@ -108,6 +108,24 @@ WHERE se.embedding_type_id = :embedding_type_id
 """
 
 
+def coerce_embedding_vector(embedding_value: Any) -> np.ndarray:
+    """Convert DB/CSV embedding payload to a float32 numpy vector."""
+    if isinstance(embedding_value, (list, tuple)):
+        return np.asarray(embedding_value, dtype=np.float32)
+
+    if isinstance(embedding_value, (bytes, bytearray, memoryview)):
+        return np.frombuffer(embedding_value, dtype=np.float32).copy()
+
+    if isinstance(embedding_value, str):
+        cleaned = embedding_value.strip().lstrip("[").rstrip("]")
+        if cleaned:
+            values = [float(token) for token in cleaned.split(",")]
+            return np.asarray(values, dtype=np.float32)
+        return np.empty((0,), dtype=np.float32)
+
+    return np.asarray(embedding_value, dtype=np.float32)
+
+
 def load_embeddings(
     engine: Engine,
     embedding_type_id: int,
@@ -144,31 +162,7 @@ def load_embeddings(
 
     for r in rows:
         accessions.append(r.accession)
-
-        # pgvector / halfvec is returned as:
-        # - list[float] (best case)
-        # - memoryview / bytes (driver dependent)
-        emb = r.embedding
-
-        if isinstance(emb, (list, tuple)):
-            # Typical pgvector / HALFVEC case in PostgreSQL
-            vec = np.asarray(emb, dtype=np.float32)
-        elif isinstance(emb, (bytes, bytearray, memoryview)):
-            # Raw bytes (e.g. BLOB in tests/SQLite): interpret as float32 buffer
-            arr = np.frombuffer(emb, dtype=np.float32)
-            vec = arr.copy()  # ensure it's writable/independent
-        elif isinstance(emb, str):
-            # Stringified vector (e.g. "[0.1,0.2,...]"): parse manually
-            cleaned = emb.strip().lstrip("[").rstrip("]")
-            if cleaned:
-                vals = [float(t) for t in cleaned.split(",")]
-                vec = np.asarray(vals, dtype=np.float32)
-            else:
-                vec = np.empty((0,), dtype=np.float32)
-        else:
-            # Fallback: try to cast directly (e.g. numpy array already)
-            vec = np.asarray(emb, dtype=np.float32)
-
+        vec = coerce_embedding_vector(r.embedding)
         vectors.append(vec)
 
     X = np.vstack(vectors)

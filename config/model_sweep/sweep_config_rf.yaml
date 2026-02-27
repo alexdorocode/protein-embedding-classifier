@@ -1,0 +1,33 @@
+method: bayes
+metric:
+  name: f1_score
+  goal: maximize
+
+parameters:
+  n_estimators:
+    values: [100, 200, 500]
+
+  criterion:
+    values: ['gini', 'entropy', 'log_loss']
+
+  max_depth:
+    values: [5, 10, 20, 30]
+
+  min_samples_split:
+    values: [2, 5, 10]
+
+  min_samples_leaf:
+    values: [1, 5, 10]
+
+  max_features:
+    values: ['sqrt', 'log2', null]
+
+  class_weight:
+    values: [null, 'balanced', 'balanced_subsample']
+
+  bootstrap_config:
+    values:
+      - {bootstrap: true, max_samples: 0.6}
+      - {bootstrap: true, max_samples: 0.8}
+      - {bootstrap: true, max_samples: 1.0}
+      - {bootstrap: false}

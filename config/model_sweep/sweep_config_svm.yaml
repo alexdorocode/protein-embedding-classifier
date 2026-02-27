@@ -1,0 +1,40 @@
+method: bayes
+metric:
+  name: f1_score
+  goal: maximize
+
+parameters:
+  kernel_config:
+    values:
+      - {kernel: 'linear'}
+      - {kernel: 'rbf', gamma: 'scale'}
+      - {kernel: 'rbf', gamma: 'auto'}
+      - {kernel: 'poly', degree: 3, gamma: 'scale', coef0: 0.0}
+      - {kernel: 'poly', degree: 3, gamma: 'scale', coef0: 0.5}
+      - {kernel: 'sigmoid', gamma: 'scale', coef0: 0.0}
+      - {kernel: 'sigmoid', gamma: 'auto', coef0: 0.5}
+
+  C:
+    min: 1e-3
+    max: 100
+    distribution: uniform
+
+  shrinking:
+    values: [True, False]
+
+  probability:
+    values: [True, False]
+
+  tol:
+    min: 1e-5
+    max: 1e-2
+    distribution: uniform
+
+  cache_size:
+    values: [200, 500]
+
+  class_weight:
+    values: [null, 'balanced']
+
+  max_iter:
+    values: [-1, 1000]

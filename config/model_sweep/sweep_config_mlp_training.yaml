@@ -1,0 +1,28 @@
+method: bayes
+metric:
+  name: f1_score
+  goal: maximize
+
+parameters:
+  optimizer_group:
+    values: ["adaptive", "classic"]
+
+  optimizer_name:
+    values: ["Adam", "RMSprop", "SGD", "Adagrad"]
+
+  learning_rate:
+    min: 1e-5
+    max: 1e-2
+    distribution: log_uniform
+
+  num_epochs:
+    values: [100, 200, 500]
+
+  early_stopping_patience:
+    values: [5, 10]
+
+  criterion_name:
+    values: ["CrossEntropyLoss", "BCEWithLogitsLoss"]
+
+  batch_size:
+    values: [32, 64]
