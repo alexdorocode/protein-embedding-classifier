@@ -1,0 +1,17 @@
+dataset:
+  db_config_path: config/db.yaml
+
+  protein_loader: {}
+
+  label_loader:
+    source: db
+    db_query_file: protein_embedding_classifier/tasks/enzyme_vs_not/labels.sql
+    accession_column: accession
+    label_column: label
+    artifacts_dir: artifacts
+
+  split:
+    strategy: zero_shot_random
+    test_size: 0.2
+    val_size: 0.1
+    random_state: 42
