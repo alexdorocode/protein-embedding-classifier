@@ -1,10 +1,10 @@
 # manual_test_rf.py
 from sqlalchemy import create_engine
-from src.core.embeddings import EmbeddingStore
-from tasks.go_term_prediction.dataset import build_dataset
+from protein_embedding_classifier.core.embeddings import EmbeddingStore
+from protein_embedding_classifier.tasks.go_term_prediction.dataset import build_dataset
 
 # 1️⃣ Connectar amb la base de dades
-from src.core.db import load_db_config, create_engine_from_config
+from protein_embedding_classifier.core.db import load_db_config, create_engine_from_config
 
 cfg = load_db_config("config/db.yaml")
 engine = create_engine_from_config(cfg)

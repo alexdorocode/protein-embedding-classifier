@@ -1,8 +1,8 @@
 import numpy as np
 from sqlalchemy import text
 
-from runners.single_layer import SingleLayerRunner
-from src.core.db import load_db_config, create_engine_from_config, EmbeddingDB
+from protein_embedding_classifier.runners.single_layer import SingleLayerRunner
+from protein_embedding_classifier.core.db import load_db_config, create_engine_from_config, EmbeddingDB
 
 
 class LoggingTask:

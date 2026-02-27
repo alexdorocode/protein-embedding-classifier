@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Tuple, List
 import numpy as np
 from sqlalchemy import text
-from src.core.embeddings import EmbeddingStore
+from protein_embedding_classifier.core.embeddings import EmbeddingStore
 from pathlib import Path
 
 class DatasetTask:
@@ -17,6 +17,9 @@ class DatasetTask:
     def load_labels(self) -> dict[str, int]:
         """Load labels from SQL file and map to integers if LABEL_MAP is defined."""
         path = Path(self.LABELS_SQL_PATH)
+        if not path.exists():
+            package_root = Path(__file__).resolve().parents[1]
+            path = package_root / self.LABELS_SQL_PATH
         if not path.exists():
             raise FileNotFoundError(f"{path} does not exist")
 

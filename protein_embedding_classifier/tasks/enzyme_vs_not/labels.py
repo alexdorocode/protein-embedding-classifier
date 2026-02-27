@@ -1,6 +1,7 @@
 from sqlalchemy import text
+from pathlib import Path
 
-LABELS_SQL_PATH = "tasks/enzyme_vs_not/labels.sql"
+LABELS_SQL_PATH = Path(__file__).with_name("labels.sql")
 
 
 def load_labels(engine) -> dict[str, int]:

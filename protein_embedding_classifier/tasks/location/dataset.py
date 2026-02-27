@@ -1,4 +1,4 @@
-from tasks.dataset_task import DatasetTask
+from protein_embedding_classifier.tasks.dataset_task import DatasetTask
 
 class LocalizationTask(DatasetTask):
     LABELS_SQL_PATH = "tasks/localization/labels.sql"

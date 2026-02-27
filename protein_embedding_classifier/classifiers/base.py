@@ -38,3 +38,9 @@ class BaseClassifier(ABC):
         """
         pass
 
+    def fit(self, X: np.ndarray, y: np.ndarray) -> None:
+        self.model.fit(X, y)
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        return self.model.predict(X)
+

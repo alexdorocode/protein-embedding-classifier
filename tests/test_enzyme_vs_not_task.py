@@ -1,8 +1,8 @@
 import numpy as np
 
-from src.core.db import load_db_config, create_engine_from_config
-from tasks.enzyme_vs_not.task import EnzymeVsNotTask
-from tasks.enzyme_vs_not.labels import load_labels
+from protein_embedding_classifier.core.db import load_db_config, create_engine_from_config
+from protein_embedding_classifier.tasks.enzyme_vs_not.task import EnzymeVsNotTask
+from protein_embedding_classifier.tasks.enzyme_vs_not.labels import load_labels
 
 
 def test_enzyme_vs_not_task_returns_labels_for_known_accessions():

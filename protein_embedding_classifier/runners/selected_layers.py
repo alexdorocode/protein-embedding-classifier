@@ -1,6 +1,6 @@
 # src/runners/selected_layers.py
 import numpy as np
-from .base import BaseRunner
+from protein_embedding_classifier.runners.base import BaseRunner
 
 
 class SelectedLayersRunner(BaseRunner):

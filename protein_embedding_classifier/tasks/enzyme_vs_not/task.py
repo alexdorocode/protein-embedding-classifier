@@ -1,6 +1,6 @@
 import numpy as np
 
-from .labels import load_labels
+from protein_embedding_classifier.tasks.enzyme_vs_not.labels import load_labels
 
 
 class EnzymeVsNotTask:

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from src.core.embeddings import EmbeddingStore
+from protein_embedding_classifier.core.embeddings import EmbeddingStore
 
 
 def test_get_uses_cache_and_db_once(monkeypatch):
@@ -22,8 +22,8 @@ def test_get_uses_cache_and_db_once(monkeypatch):
         X = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
         return accessions, X
 
-    monkeypatch.setattr("src.core.embeddings.resolve_embedding_type_id", fake_resolve)
-    monkeypatch.setattr("src.core.embeddings.load_embeddings", fake_load)
+    monkeypatch.setattr("protein_embedding_classifier.core.embeddings.resolve_embedding_type_id", fake_resolve)
+    monkeypatch.setattr("protein_embedding_classifier.core.embeddings.load_embeddings", fake_load)
 
     store = EmbeddingStore(engine=object(), normalize=False)
 
@@ -50,8 +50,8 @@ def test_get_applies_l2_normalization(monkeypatch):
         X = np.array([[3.0, 4.0], [0.0, 0.0]], dtype=np.float32)
         return accessions, X
 
-    monkeypatch.setattr("src.core.embeddings.resolve_embedding_type_id", fake_resolve)
-    monkeypatch.setattr("src.core.embeddings.load_embeddings", fake_load)
+    monkeypatch.setattr("protein_embedding_classifier.core.embeddings.resolve_embedding_type_id", fake_resolve)
+    monkeypatch.setattr("protein_embedding_classifier.core.embeddings.load_embeddings", fake_load)
 
     store = EmbeddingStore(engine=object(), normalize=True)
     acc, X = store.get("Any", layer=0)

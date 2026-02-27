@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from typing import Tuple, List
+from pathlib import Path
 import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
-from src.core.embeddings import EmbeddingStore
+from protein_embedding_classifier.core.embeddings import EmbeddingStore
 
-LABELS_SQL_PATH = "tasks/go_term_prediction/labels.sql"
+LABELS_SQL_PATH = Path(__file__).with_name("labels.sql")
 
 
 def load_labels(engine) -> Tuple[List[str], List[str]]:

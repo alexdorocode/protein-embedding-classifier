@@ -1,6 +1,6 @@
 # src/layer_aggregation/mean.py
 import numpy as np
-from .base import LayerAggregator
+from protein_embedding_classifier.layer_aggregation.base import LayerAggregator
 
 
 class MeanAggregation(LayerAggregator):

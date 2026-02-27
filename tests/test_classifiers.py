@@ -1,10 +1,10 @@
 import numpy as np
 import pytest
 
-from classifiers.linear import LogisticRegressionClassifier
-from classifiers.mlp import MLPClassifierWrapper
-from classifiers.random_forest import RandomForestClassifierWrapper
-from classifiers.registry import get_classifier, CLASSIFIERS
+from protein_embedding_classifier.classifiers.linear import LogisticRegressionClassifier
+from protein_embedding_classifier.classifiers.mlp import MLPClassifierWrapper
+from protein_embedding_classifier.classifiers.random_forest import RandomForestClassifierWrapper
+from protein_embedding_classifier.classifiers.registry import get_classifier, CLASSIFIERS
 
 
 def _make_toy_binary_data(n_samples: int = 50, dim: int = 4):

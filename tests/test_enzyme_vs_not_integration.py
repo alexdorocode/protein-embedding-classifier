@@ -1,9 +1,9 @@
 import numpy as np
 
-from src.core.db import load_db_config, create_engine_from_config
-from src.core.embeddings import EmbeddingStore
-from tasks.enzyme_vs_not.dataset import build_dataset
-from src.classifiers.registry import get_classifier
+from protein_embedding_classifier.core.db import load_db_config, create_engine_from_config
+from protein_embedding_classifier.core.embeddings import EmbeddingStore
+from protein_embedding_classifier.tasks.enzyme_vs_not.dataset import build_dataset
+from protein_embedding_classifier.classifiers.registry import get_classifier
 
 
 def test_enzyme_vs_not_logistic_end_to_end():

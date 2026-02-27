@@ -1,7 +1,7 @@
 import numpy as np
 import wandb
 
-from src.core.tracking import WandBTracker
+from protein_embedding_classifier.core.tracking import WandBTracker
 
 
 def test_wandbtracker_disabled_does_not_call_wandb(monkeypatch):

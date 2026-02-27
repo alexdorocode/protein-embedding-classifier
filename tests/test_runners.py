@@ -1,8 +1,8 @@
 import numpy as np
 
-from runners.single_layer import SingleLayerRunner
-from runners.selected_layers import SelectedLayersRunner
-from runners.attention_over_layers import AttentionOverLayersRunner
+from protein_embedding_classifier.runners.single_layer import SingleLayerRunner
+from protein_embedding_classifier.runners.selected_layers import SelectedLayersRunner
+from protein_embedding_classifier.runners.attention_over_layers import AttentionOverLayersRunner
 
 
 class FakeDB:

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from src.core.embeddings import EmbeddingLayerSweep
+from protein_embedding_classifier.core.embeddings import EmbeddingLayerSweep
 
 
 class FakeDB:

@@ -1,35 +1,37 @@
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Tuple
 
 import numpy as np
-from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import accuracy_score, f1_score
 
-from .base import BaseClassifier
+from protein_embedding_classifier.classifiers.base import BaseClassifier
 
 
-class LogisticRegressionClassifier(BaseClassifier):
+class MLPClassifierWrapper(BaseClassifier):
     def __init__(
         self,
-        C: float = 1.0,
-        max_iter: int = 1000,
-        class_weight: str | None = "balanced",
+        hidden_layer_sizes: Tuple[int, ...] = (256,),
+        activation: str = "relu",
+        alpha: float = 1e-4,
+        max_iter: int = 200,
         random_state: int = 42,
     ):
-        self.C = C
+        self.hidden_layer_sizes = hidden_layer_sizes
+        self.activation = activation
+        self.alpha = alpha
         self.max_iter = max_iter
-        self.class_weight = class_weight
         self.random_state = random_state
         self._build_model()
 
     def _build_model(self):
-        self.model = LogisticRegression(
-            C=self.C,
+        self.model = MLPClassifier(
+            hidden_layer_sizes=self.hidden_layer_sizes,
+            activation=self.activation,
+            alpha=self.alpha,
             max_iter=self.max_iter,
-            class_weight=self.class_weight,
             random_state=self.random_state,
-            n_jobs=1,
         )
 
     def reset(self):

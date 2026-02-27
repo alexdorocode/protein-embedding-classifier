@@ -19,7 +19,7 @@ from typing import Dict, Tuple, List
 
 import numpy as np
 
-from .db import (
+from protein_embedding_classifier.core.db import (
     load_embeddings,
     resolve_embedding_type_id,
 )
@@ -148,3 +148,38 @@ class EmbeddingStore:
         norms = np.linalg.norm(X, axis=1, keepdims=True)
         norms[norms == 0.0] = 1.0
         return X / norms
+
+
+class EmbeddingLayerSweep:
+    """
+    Run one experiment function across multiple embedding layers.
+    """
+
+    def __init__(self, db):
+        self.db = db
+
+    def run(
+        self,
+        embedding_type_id: int,
+        layers: Iterable[int],
+        experiment_fn: Callable[[int, list[str], np.ndarray], dict],
+        batch_size: int = 1000,
+    ) -> Dict[int, dict]:
+        results: Dict[int, dict] = {}
+
+        for layer_index in layers:
+            accessions = []
+            embeddings = []
+
+            for accession, embedding in self.db.fetch_embeddings_by_layer(
+                embedding_type_id=embedding_type_id,
+                layer_index=layer_index,
+                batch_size=batch_size,
+            ):
+                accessions.append(accession)
+                embeddings.append(embedding)
+
+            X = np.asarray(embeddings)
+            results[layer_index] = experiment_fn(layer_index, accessions, X)
+
+        return results

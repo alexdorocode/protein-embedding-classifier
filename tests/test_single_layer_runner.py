@@ -1,6 +1,6 @@
 import numpy as np
 
-from runners.single_layer import SingleLayerRunner
+from protein_embedding_classifier.runners.single_layer import SingleLayerRunner
 
 
 class FakeDB:

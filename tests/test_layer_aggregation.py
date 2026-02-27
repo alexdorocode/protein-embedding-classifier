@@ -1,8 +1,8 @@
 import numpy as np
 import pytest
 
-from src.layer_aggregation.mean import MeanAggregation
-from src.layer_aggregation.attention import AttentionAggregation
+from protein_embedding_classifier.layer_aggregation.mean import MeanAggregation
+from protein_embedding_classifier.layer_aggregation.attention import AttentionAggregation
 
 
 def _make_dummy_layers(n_layers: int = 3, n_samples: int = 5, dim: int = 4) -> np.ndarray:

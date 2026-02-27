@@ -2,7 +2,7 @@ import yaml
 import numpy as np
 from sqlalchemy import create_engine, text
 
-from src.core.db import load_db_config, resolve_embedding_type_id, load_embeddings
+from protein_embedding_classifier.core.db import load_db_config, resolve_embedding_type_id, load_embeddings
 
 
 def test_load_db_config(tmp_path):

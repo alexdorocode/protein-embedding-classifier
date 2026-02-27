@@ -6,7 +6,7 @@ import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score
 
-from .base import BaseClassifier
+from protein_embedding_classifier.classifiers.base import BaseClassifier
 
 
 class RandomForestClassifierWrapper(BaseClassifier):

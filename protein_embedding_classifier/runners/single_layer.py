@@ -4,7 +4,7 @@ from typing import Iterable, Optional
 
 import numpy as np
 
-from .base import BaseRunner
+from protein_embedding_classifier.runners.base import BaseRunner
 
 
 class SingleLayerRunner(BaseRunner):

@@ -4,7 +4,7 @@ from typing import Optional
 
 import numpy as np
 
-from .base import LayerAggregator
+from protein_embedding_classifier.layer_aggregation.base import LayerAggregator
 
 
 class AttentionAggregation(LayerAggregator):
