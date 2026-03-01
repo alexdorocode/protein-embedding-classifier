@@ -69,6 +69,8 @@ def test_training_service_returns_expected_dictionary_structure():
     assert "model" in payload
     assert "val_probs" in payload
     assert "metrics" in payload
+    assert "validation" in payload["metrics"]
+    assert "test" in payload["metrics"]
 
 
 def test_training_service_trains_per_embedding():
@@ -93,7 +95,7 @@ def test_training_service_metrics_exist():
     )
 
     for payload in results.values():
-        assert "f1_score" in payload["metrics"]
+        assert "f1" in payload["metrics"]["validation"]
 
 
 def test_training_service_handles_multilabel_targets():
@@ -133,7 +135,7 @@ def test_training_service_handles_multilabel_targets():
 
     payload = results[("LR", "ESM3c")]
     assert payload["val_probs"].shape == (4, 3)
-    assert "f1_score" in payload["metrics"]
+    assert "macro_f1" in payload["metrics"]["validation"]
 
 
 def test_training_service_l2_normalization_rowwise_unit_norm():

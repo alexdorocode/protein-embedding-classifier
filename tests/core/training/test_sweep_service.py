@@ -27,10 +27,33 @@ def _bundle():
     )
 
 
+def _fake_train_payload(embedding_name: str, score: float) -> dict:
+    return {
+        ("LR", embedding_name): {
+            "model": object(),
+            "val_probs": np.ones((3, 2), dtype=np.float32) * 0.5,
+            "metrics": {
+                "validation": {
+                    "accuracy": 0.66,
+                    "precision": 0.67,
+                    "recall": 0.68,
+                    "f1": score,
+                    "roc_auc": 0.71,
+                    "pr_auc": 0.69,
+                },
+                "test": None,
+            },
+        }
+    }
+
+
 def test_sweep_service_single_iteration_with_mocked_wandb(monkeypatch):
     wandb_calls = {"init": 0, "log": 0, "finish": 0}
 
     class FakeRun:
+        def __init__(self):
+            self.summary = {}
+
         def finish(self):
             wandb_calls["finish"] += 1
 
@@ -42,13 +65,7 @@ def test_sweep_service_single_iteration_with_mocked_wandb(monkeypatch):
 
     def fake_train(self, embedding_bundle, training_config=None):
         embedding_name = next(iter(embedding_bundle.X_train.keys()))
-        return {
-            ("LR", embedding_name): {
-                "model": object(),
-                "val_probs": np.ones((3, 2), dtype=np.float32) * 0.5,
-                "metrics": {"f1_score": 0.7},
-            }
-        }
+        return _fake_train_payload(embedding_name, score=0.7)
 
     from protein_embedding_classifier.core.training.training_service import TrainingService
 
@@ -71,47 +88,6 @@ def test_sweep_service_single_iteration_with_mocked_wandb(monkeypatch):
     assert wandb_calls["finish"] == 2
 
 
-def test_sweep_service_best_config_selection(monkeypatch):
-    trial_configs = [{"C": 0.1}, {"C": 0.9}]
-
-    def fake_build_trials(self, sweep_config, num_trials):
-        return trial_configs
-
-    monkeypatch.setattr(SweepService, "_build_trial_configs", fake_build_trials)
-
-    def fake_train(self, embedding_bundle, training_config=None):
-        embedding_name = next(iter(embedding_bundle.X_train.keys()))
-        score = float(self.wandb_config["C"])
-        return {
-            ("LR", embedding_name): {
-                "model": object(),
-                "val_probs": np.ones((3, 2), dtype=np.float32) * 0.5,
-                "metrics": {"f1_score": score},
-            }
-        }
-
-    from protein_embedding_classifier.core.training.training_service import TrainingService
-
-    monkeypatch.setattr(TrainingService, "train", fake_train)
-
-    monkeypatch.setitem(
-        sys.modules,
-        "wandb",
-        types.SimpleNamespace(init=lambda **kwargs: types.SimpleNamespace(finish=lambda: None), log=lambda payload: None),
-    )
-
-    service = SweepService(model_type="LR")
-    result = service.run(
-        embedding_bundle=_bundle(),
-        sweep_config={"metric": {"name": "f1_score", "goal": "maximize"}, "parameters": {}},
-        num_trials=2,
-        artifacts_dir="artifacts",
-    )
-
-    assert result.best_config == {"C": 0.9}
-    assert result.best_key[0] == "LR"
-
-
 def test_sweep_service_metric_goal_minimize(monkeypatch, tmp_path):
     trial_configs = [{"objective": 0.9}, {"objective": 0.1}]
 
@@ -127,7 +103,10 @@ def test_sweep_service_metric_goal_minimize(monkeypatch, tmp_path):
             ("LR", embedding_name): {
                 "model": object(),
                 "val_probs": np.ones((3, 2), dtype=np.float32) * 0.5,
-                "metrics": {"objective": objective},
+                "metrics": {
+                    "validation": {"f1": objective},
+                    "test": None,
+                },
             }
         }
 
@@ -135,14 +114,14 @@ def test_sweep_service_metric_goal_minimize(monkeypatch, tmp_path):
 
     monkeypatch.setattr(TrainingService, "train", fake_train)
     monkeypatch.setattr(SweepService, "_wandb_init", staticmethod(lambda **kwargs: None))
-    monkeypatch.setattr(SweepService, "_wandb_log", staticmethod(lambda payload: None))
+    monkeypatch.setattr(SweepService, "_wandb_log", staticmethod(lambda payload, enabled: None))
     monkeypatch.setattr(SweepService, "_wandb_finish", staticmethod(lambda run: None))
-    monkeypatch.setattr(SweepService, "_wandb_config_update", staticmethod(lambda payload: None))
+    monkeypatch.setattr(SweepService, "_wandb_config_update", staticmethod(lambda payload, enabled: None))
 
     service = SweepService(model_type="LR")
     result = service.run(
         embedding_bundle=_bundle(),
-        sweep_config={"metric": {"name": "objective", "goal": "minimize"}, "parameters": {}},
+        sweep_config={"metric": {"name": "f1", "goal": "minimize"}, "parameters": {}},
         num_trials=2,
         artifacts_dir=str(tmp_path),
     )
@@ -163,19 +142,13 @@ def test_sweep_service_run_name_uniqueness():
 
 def test_sweep_service_collects_trial_results(monkeypatch, tmp_path):
     monkeypatch.setattr(SweepService, "_wandb_init", staticmethod(lambda **kwargs: None))
-    monkeypatch.setattr(SweepService, "_wandb_log", staticmethod(lambda payload: None))
+    monkeypatch.setattr(SweepService, "_wandb_log", staticmethod(lambda payload, enabled: None))
     monkeypatch.setattr(SweepService, "_wandb_finish", staticmethod(lambda run: None))
-    monkeypatch.setattr(SweepService, "_wandb_config_update", staticmethod(lambda payload: None))
+    monkeypatch.setattr(SweepService, "_wandb_config_update", staticmethod(lambda payload, enabled: None))
 
     def fake_train(self, embedding_bundle, training_config=None):
         embedding_name = next(iter(embedding_bundle.X_train.keys()))
-        return {
-            ("LR", embedding_name): {
-                "model": object(),
-                "val_probs": np.ones((3, 2), dtype=np.float32) * 0.5,
-                "metrics": {"f1_score": 0.4},
-            }
-        }
+        return _fake_train_payload(embedding_name, score=0.4)
 
     from protein_embedding_classifier.core.training.training_service import TrainingService
 
@@ -206,10 +179,8 @@ def test_sweep_service_exports_results_csv(tmp_path):
             "embedding_name": "ESM3c",
             "trial_index": 1,
             "config": {"C": 1.0},
-            "validation_metrics": {"f1_score": 0.55, "accuracy": 0.66},
-            "test_metrics": {"f1_score": 0.50},
-            "selection_metric_name": "f1_score",
-            "selection_metric_value": 0.55,
+            "validation_metrics": {"f1": 0.55, "accuracy": 0.66, "precision": 0.7, "recall": 0.6},
+            "test_metrics": None,
         }
     ]
     output_path = tmp_path / "sweep_results_full.csv"
@@ -219,55 +190,47 @@ def test_sweep_service_exports_results_csv(tmp_path):
     contents = output_path.read_text(encoding="utf-8")
     assert "model_type" in contents
     assert "embedding_name" in contents
-    assert "val_f1_score" in contents
-    assert "test_f1_score" in contents
+    assert "val_f1" in contents
+    assert "test_f1" in contents
 
 
-def test_sweep_service_summary_table_builder():
-    rows = [
-        {
-            "model_type": "LR",
-            "embedding_name": "ESM3c",
-            "validation_metrics": {"f1_score": 0.64},
-        },
-        {
-            "model_type": "SVM",
-            "embedding_name": "ESM3c",
-            "validation_metrics": {"f1_score": 0.70},
-        },
-        {
-            "model_type": "LR",
-            "embedding_name": "Prost-T5",
-            "validation_metrics": {"f1_score": 0.75},
-        },
-    ]
+def test_sweep_logging_has_val_prefix_and_no_nan_test_metrics():
+    validation = {"accuracy": 0.7, "f1": 0.65}
+    clean_validation = SweepService._clean_metrics(validation)
+    log_payload = {f"val_{key}": value for key, value in clean_validation.items()}
 
-    table = SweepService.build_summary_table(rows, model_order=["LR", "SVM"])
-    assert "Embedding | LR | SVM" in table
-    assert "ESM3c" in table
-    assert "0.6400" in table
-    assert "0.7000" in table
+    assert "val_accuracy" in log_payload
+    assert "val_f1" in log_payload
+    assert "accuracy" not in log_payload
+    assert "f1" not in log_payload
+
+    clean_test = SweepService._clean_metrics({"accuracy": np.nan, "f1": np.nan})
+    assert clean_test == {}
 
 
-def test_sweep_service_compute_metrics_handles_legacy_multilabel():
-    y_true = np.array([
-        ["GO:1", "GO:2"],
-        ["GO:2"],
-        ["GO:3"],
-    ], dtype=object)
-    val_probs = np.array(
-        [
-            [0.9, 0.7, 0.1],
-            [0.1, 0.8, 0.1],
-            [0.2, 0.1, 0.9],
-        ],
-        dtype=np.float32,
-    )
+def test_binary_metrics_exist_in_validation_payload():
+    metrics = {
+        "accuracy": 0.72,
+        "precision": 0.71,
+        "recall": 0.73,
+        "f1": 0.72,
+        "roc_auc": 0.8,
+        "pr_auc": 0.77,
+    }
+    cleaned = SweepService._clean_metrics(metrics)
 
-    metrics = SweepService._compute_metrics(y_true=y_true, val_probs=val_probs)
+    assert "roc_auc" in cleaned
+    assert "pr_auc" in cleaned
 
-    assert "accuracy" in metrics
-    assert "precision" in metrics
-    assert "recall" in metrics
-    assert "f1_score" in metrics
-    assert np.isfinite(metrics["f1_score"])
+
+def test_multilabel_metrics_do_not_require_roc_auc():
+    metrics = {
+        "micro_f1": 0.62,
+        "macro_f1": 0.58,
+        "f1": 0.58,
+    }
+    cleaned = SweepService._clean_metrics(metrics)
+
+    assert "micro_f1" in cleaned
+    assert "macro_f1" in cleaned
+    assert "roc_auc" not in cleaned

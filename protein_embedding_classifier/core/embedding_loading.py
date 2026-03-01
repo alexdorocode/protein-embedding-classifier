@@ -269,6 +269,8 @@ class GOEmbeddingLoader:
             list(ontology_embeddings.keys()),
         )
 
+        return {"GeOKG": concatenated_embeddings}
+
     @staticmethod
     def _resolve_go_file_names(file_info: dict[str, Any]) -> list[str]:
         if "file_names" in file_info:

@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import csv
 import logging
-from datetime import datetime
-from pathlib import Path
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import numpy as np
-from sklearn.metrics import accuracy_score, average_precision_score, f1_score, precision_score, recall_score, roc_auc_score
-from sklearn.preprocessing import MultiLabelBinarizer, StandardScaler, normalize
 
 from protein_embedding_classifier.core.embedding_loading import EmbeddingBundle
 from protein_embedding_classifier.core.training.model_factory import ModelFactory
@@ -47,6 +45,9 @@ class SweepService:
         training_config: dict[str, Any] | None = None,
         wandb_project: str = "protein-embedding-classifier",
         artifacts_dir: str = "artifacts",
+        wandb_enabled: bool = True,
+        wandb_mode: str = "online",
+        wandb_entity: str | None = None,
     ) -> SweepResult:
         trial_configs = self._build_trial_configs(sweep_config, num_trials)
         if not trial_configs:
@@ -55,6 +56,7 @@ class SweepService:
         metric_name = str(sweep_config.get("metric", {}).get("name", "f1_score"))
         metric_goal = str(sweep_config.get("metric", {}).get("goal", "maximize")).lower()
         maximize_metric = metric_goal != "minimize"
+        selection_key = self._metric_name_to_validation_key(metric_name)
 
         best_metric = float("-inf") if maximize_metric else float("inf")
         best_config: dict[str, Any] = {}
@@ -66,35 +68,31 @@ class SweepService:
 
         for trial_index, params in enumerate(trial_configs, start=1):
             for embedding_name in embedding_names:
-                single_embedding_bundle = self._single_embedding_bundle(embedding_bundle, embedding_name)
                 run_name = self._build_run_name(
                     model_type=self.model_type,
                     embedding_name=embedding_name,
                     trial_index=trial_index,
                     timestamp=run_timestamp,
                 )
+
                 run = self._wandb_init(
                     wandb_project=wandb_project,
-                    config=params,
-                    trial_index=trial_index,
+                    config=dict(params),
                     run_name=run_name,
+                    enabled=wandb_enabled,
+                    mode=wandb_mode,
+                    entity=wandb_entity,
                 )
+
                 try:
-                    service = TrainingService(
-                        model_factory=self.model_factory,
-                        sweep_mode=True,
-                        wandb_config=params,
-                    )
-
-                    effective_training_config = dict(training_config or {})
-                    effective_training_config["model_types"] = [self.model_type]
-
-                    problem_spec = ProblemSpecification.from_labels(single_embedding_bundle.y_train)
+                    single_bundle = self._single_embedding_bundle(embedding_bundle, embedding_name)
+                    problem_spec = ProblemSpecification.from_labels(single_bundle.y_train)
                     normalization_mode = self._resolve_normalization_mode(
-                        training_config=effective_training_config,
+                        training_config=dict(training_config or {}),
                         trial_params=params,
                     )
-                    full_config_payload = self._build_tracking_config(
+
+                    tracking_config = self._build_tracking_config(
                         trial_params=params,
                         model_type=self.model_type,
                         embedding_name=embedding_name,
@@ -102,39 +100,46 @@ class SweepService:
                         problem_type=problem_spec.problem_type,
                         random_seed=self.rng_seed,
                     )
-                    self._wandb_config_update(full_config_payload)
+                    self._wandb_config_update(tracking_config, enabled=wandb_enabled)
 
+                    effective_training_config = dict(training_config or {})
+                    effective_training_config["model_types"] = [self.model_type]
+
+                    service = TrainingService(
+                        model_factory=self.model_factory,
+                        sweep_mode=True,
+                        wandb_config=params,
+                    )
                     results = service.train(
-                        embedding_bundle=single_embedding_bundle,
+                        embedding_bundle=single_bundle,
                         training_config=effective_training_config,
                     )
 
                     result_key, payload = next(iter(results.items()))
-                    val_probs = np.asarray(payload.get("val_probs"))
-                    val_metrics = self._compute_metrics(
-                        y_true=np.asarray(single_embedding_bundle.y_val),
-                        val_probs=val_probs,
-                    )
-                    test_metrics = self._compute_test_metrics(
-                        model=payload.get("model"),
-                        x_train=np.asarray(single_embedding_bundle.X_train[embedding_name]),
-                        x_test=np.asarray(single_embedding_bundle.X_test[embedding_name]),
-                        y_test=np.asarray(single_embedding_bundle.y_test),
-                        normalization_mode=normalization_mode,
-                    )
+                    metrics_payload = payload.get("metrics", {}) if isinstance(payload.get("metrics", {}), Mapping) else {}
+                    validation_metrics = dict(metrics_payload.get("validation", {})) if isinstance(metrics_payload.get("validation", {}), Mapping) else {}
+                    test_metrics_raw = metrics_payload.get("test")
+                    test_metrics = dict(test_metrics_raw) if isinstance(test_metrics_raw, Mapping) else None
 
-                    metric_value = float(
-                        payload.get("metrics", {}).get(metric_name, val_metrics.get(metric_name, float("nan")) )
-                    )
+                    clean_validation = self._clean_metrics(validation_metrics)
+                    clean_test = self._clean_metrics(test_metrics) if test_metrics is not None else None
+                    if clean_test == {}:
+                        clean_test = None
 
+                    val_log_payload = {f"val_{key}": value for key, value in clean_validation.items()}
                     log_payload = {
-                        **val_metrics,
-                        **{f"test_{name}": value for name, value in test_metrics.items()},
+                        **val_log_payload,
                         "trial_index": trial_index,
                         "model_type": result_key[0],
                         "embedding_name": result_key[1],
                     }
-                    self._wandb_log(log_payload)
+                    if clean_test is not None:
+                        log_payload.update({f"test_{key}": value for key, value in clean_test.items()})
+
+                    self._wandb_log(log_payload, enabled=wandb_enabled)
+                    self._wandb_update_summary(run, clean_validation, clean_test)
+
+                    metric_value = float(clean_validation.get(selection_key, float("nan")))
 
                     all_trial_results.append(
                         {
@@ -142,18 +147,12 @@ class SweepService:
                             "embedding_name": result_key[1],
                             "trial_index": trial_index,
                             "config": dict(params),
-                            "validation_metrics": dict(val_metrics),
-                            "test_metrics": dict(test_metrics),
-                            "selection_metric_name": metric_name,
-                            "selection_metric_value": metric_value,
+                            "validation_metrics": dict(clean_validation),
+                            "test_metrics": dict(clean_test) if clean_test is not None else None,
                         }
                     )
 
-                    if np.isfinite(metric_value) and self._is_better(
-                        candidate=metric_value,
-                        current_best=best_metric,
-                        maximize=maximize_metric,
-                    ):
+                    if np.isfinite(metric_value) and self._is_better(metric_value, best_metric, maximize_metric):
                         best_metric = metric_value
                         best_config = dict(params)
                         best_key = result_key
@@ -165,9 +164,7 @@ class SweepService:
 
         artifacts_path = Path(artifacts_dir)
         artifacts_path.mkdir(parents=True, exist_ok=True)
-        full_results_csv_path = artifacts_path / "sweep_results_full.csv"
-        self._export_trial_results_csv(full_results_csv_path, all_trial_results)
-        self.logger.info("Sweep full results CSV saved: %s", full_results_csv_path)
+        self._export_trial_results_csv(artifacts_path / "sweep_results_full.csv", all_trial_results)
 
         self.logger.info(
             "Sweep completed model_type=%s best_embedding=%s %s=%.6f",
@@ -176,6 +173,7 @@ class SweepService:
             metric_name,
             best_metric,
         )
+
         return SweepResult(
             best_config=best_config,
             best_metric=best_metric,
@@ -187,7 +185,6 @@ class SweepService:
         parameters = sweep_config.get("parameters", {})
         if not isinstance(parameters, Mapping):
             return []
-
         return [self._sample_trial(parameters) for _ in range(int(max(1, num_trials)))]
 
     def _sample_trial(self, parameters: Mapping[str, Any]) -> dict[str, Any]:
@@ -200,8 +197,7 @@ class SweepService:
                 values = list(spec["values"])
                 if not values:
                     continue
-                idx = int(self.rng.integers(0, len(values)))
-                sampled[key] = values[idx]
+                sampled[key] = values[int(self.rng.integers(0, len(values)))]
                 continue
 
             if "min" in spec and "max" in spec:
@@ -219,28 +215,6 @@ class SweepService:
                     sampled[key] = float(self.rng.uniform(float(min_value), float(max_value)))
 
         return sampled
-
-    @staticmethod
-    def _wandb_init(wandb_project: str, config: dict[str, Any], trial_index: int):
-        try:
-            import wandb
-        except ImportError:
-            return None
-        return wandb.init(project=wandb_project, config=config, name=f"sweep-trial-{trial_index}")
-
-    @staticmethod
-    def _wandb_log(payload: dict[str, Any]) -> None:
-        try:
-            import wandb
-        except ImportError:
-            return
-        wandb.log(payload)
-
-    @staticmethod
-    def _wandb_finish(run) -> None:
-        if run is None:
-            return
-        run.finish()
 
     @staticmethod
     def _single_embedding_bundle(bundle: EmbeddingBundle, embedding_name: str) -> EmbeddingBundle:
@@ -288,7 +262,173 @@ class SweepService:
         }
 
     @staticmethod
-    def _wandb_config_update(payload: dict[str, Any]) -> None:
+    def _resolve_normalization_mode(training_config: dict[str, Any], trial_params: Mapping[str, Any]) -> str:
+        feature_processing = training_config.get("feature_processing", {})
+        mode = "none"
+        if isinstance(feature_processing, Mapping):
+            mode = str(feature_processing.get("normalize", "none"))
+
+        if "normalize" in trial_params:
+            mode = str(trial_params["normalize"])
+        nested = trial_params.get("feature_processing")
+        if isinstance(nested, Mapping) and "normalize" in nested:
+            mode = str(nested["normalize"])
+
+        normalized = mode.lower()
+        return normalized if normalized in {"none", "l2", "standard"} else "none"
+
+    @staticmethod
+    def _metric_name_to_validation_key(metric_name: str) -> str:
+        normalized = metric_name.lower()
+        if normalized.startswith("val_"):
+            normalized = normalized[4:]
+
+        aliases = {
+            "f1_score": "f1",
+            "f1": "f1",
+            "accuracy": "accuracy",
+            "precision": "precision",
+            "recall": "recall",
+            "roc_auc": "roc_auc",
+            "pr_auc": "pr_auc",
+            "micro_f1": "micro_f1",
+            "macro_f1": "macro_f1",
+        }
+        return aliases.get(normalized, normalized)
+
+    @staticmethod
+    def _is_better(candidate: float, current_best: float, maximize: bool) -> bool:
+        return candidate > current_best if maximize else candidate < current_best
+
+    @staticmethod
+    def _clean_metrics(metrics: Mapping[str, Any] | None) -> dict[str, Any]:
+        if metrics is None:
+            return {}
+
+        cleaned: dict[str, Any] = {}
+        for key, value in metrics.items():
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple, dict)):
+                cleaned[key] = value
+                continue
+            if isinstance(value, (int, float, np.floating)):
+                if np.isfinite(float(value)):
+                    cleaned[key] = float(value)
+                continue
+        return cleaned
+
+    def _export_trial_results_csv(self, output_path: Path, trial_results: list[dict[str, Any]]) -> None:
+        columns = [
+            "model_type",
+            "embedding_name",
+            "trial_index",
+            "val_accuracy",
+            "val_precision",
+            "val_recall",
+            "val_f1",
+            "val_roc_auc",
+            "val_pr_auc",
+            "test_accuracy",
+            "test_precision",
+            "test_recall",
+            "test_f1",
+        ]
+
+        with output_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns)
+            writer.writeheader()
+
+            for result in trial_results:
+                validation = result.get("validation_metrics", {}) if isinstance(result.get("validation_metrics", {}), Mapping) else {}
+                test = result.get("test_metrics") if isinstance(result.get("test_metrics"), Mapping) else {}
+
+                row = {
+                    "model_type": result.get("model_type", ""),
+                    "embedding_name": result.get("embedding_name", ""),
+                    "trial_index": result.get("trial_index", ""),
+                    "val_accuracy": validation.get("accuracy", ""),
+                    "val_precision": validation.get("precision", ""),
+                    "val_recall": validation.get("recall", ""),
+                    "val_f1": validation.get("f1", validation.get("macro_f1", "")),
+                    "val_roc_auc": validation.get("roc_auc", ""),
+                    "val_pr_auc": validation.get("pr_auc", ""),
+                    "test_accuracy": test.get("accuracy", ""),
+                    "test_precision": test.get("precision", ""),
+                    "test_recall": test.get("recall", ""),
+                    "test_f1": test.get("f1", test.get("macro_f1", "")),
+                }
+                writer.writerow(row)
+
+    @staticmethod
+    def build_summary_table(trial_results: list[dict[str, Any]], model_order: list[str]) -> str:
+        header = ["Embedding", *model_order]
+        if not trial_results:
+            return " | ".join(header)
+
+        table: dict[str, dict[str, float]] = {}
+        for row in trial_results:
+            embedding_name = str(row.get("embedding_name"))
+            model_type = str(row.get("model_type"))
+            validation = row.get("validation_metrics", {}) if isinstance(row.get("validation_metrics", {}), Mapping) else {}
+            value = validation.get("f1", validation.get("macro_f1"))
+            if value is None or not isinstance(value, (int, float, np.floating)) or not np.isfinite(float(value)):
+                continue
+
+            table.setdefault(embedding_name, {})
+            current = table[embedding_name].get(model_type)
+            if current is None or float(value) > current:
+                table[embedding_name][model_type] = float(value)
+
+        lines = [" | ".join(header), "-" * (len(" | ".join(header)) + 8)]
+        for embedding_name in sorted(table.keys()):
+            values = [embedding_name]
+            for model_type in model_order:
+                score = table[embedding_name].get(model_type)
+                values.append("-" if score is None else f"{score:.4f}")
+            lines.append(" | ".join(values))
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _wandb_init(
+        wandb_project: str,
+        config: dict[str, Any],
+        run_name: str,
+        enabled: bool,
+        mode: str,
+        entity: str | None,
+    ):
+        if not enabled:
+            return None
+        try:
+            import wandb
+        except ImportError:
+            return None
+        init_kwargs: dict[str, Any] = {
+            "project": wandb_project,
+            "config": config,
+            "name": run_name,
+            "mode": mode,
+        }
+        if entity:
+            init_kwargs["entity"] = entity
+        return wandb.init(**init_kwargs)
+
+    @staticmethod
+    def _wandb_log(payload: dict[str, Any], enabled: bool) -> None:
+        if not enabled:
+            return
+        try:
+            import wandb
+        except ImportError:
+            return
+        wandb.log(payload)
+
+    @staticmethod
+    def _wandb_config_update(payload: dict[str, Any], enabled: bool) -> None:
+        if not enabled:
+            return
         try:
             import wandb
         except ImportError:
@@ -299,195 +439,28 @@ class SweepService:
         config_obj.update(payload, allow_val_change=True)
 
     @staticmethod
-    def _is_better(candidate: float, current_best: float, maximize: bool) -> bool:
-        if maximize:
-            return candidate > current_best
-        return candidate < current_best
-
-    @staticmethod
-    def _resolve_normalization_mode(training_config: dict[str, Any], trial_params: Mapping[str, Any]) -> str:
-        feature_processing = training_config.get("feature_processing", {})
-        normalize_mode = "none"
-        if isinstance(feature_processing, Mapping):
-            normalize_mode = str(feature_processing.get("normalize", "none"))
-
-        if "normalize" in trial_params:
-            normalize_mode = str(trial_params["normalize"])
-        trial_feature_processing = trial_params.get("feature_processing")
-        if isinstance(trial_feature_processing, Mapping) and "normalize" in trial_feature_processing:
-            normalize_mode = str(trial_feature_processing["normalize"])
-
-        normalized = normalize_mode.lower()
-        if normalized not in {"none", "l2", "standard"}:
-            return "none"
-        return normalized
-
-    @staticmethod
-    def _preprocess_for_inference(x_train: np.ndarray, x_eval: np.ndarray, normalization_mode: str) -> np.ndarray:
-        if normalization_mode == "none":
-            return np.asarray(x_eval)
-        if normalization_mode == "l2":
-            return normalize(np.asarray(x_eval), norm="l2", axis=1)
-
-        scaler = StandardScaler()
-        scaler.fit(np.asarray(x_train))
-        return scaler.transform(np.asarray(x_eval))
-
-    @staticmethod
-    def _compute_metrics(y_true: np.ndarray, val_probs: np.ndarray) -> dict[str, float]:
-        y_true_array = np.asarray(y_true)
-        probs = np.asarray(val_probs)
-
-        metrics: dict[str, float] = {
-            "accuracy": float("nan"),
-            "precision": float("nan"),
-            "recall": float("nan"),
-            "f1_score": float("nan"),
-        }
-
-        if probs.ndim != 2 or y_true_array.ndim != 1:
-            return metrics
-
-        if SweepService._is_legacy_multilabel_target(y_true_array):
-            y_true_bin = SweepService._binarize_legacy_multilabel(y_true_array)
-            y_pred_bin = (probs >= 0.5).astype(int)
-            if y_true_bin.shape != y_pred_bin.shape:
-                return metrics
-            metrics.update(
-                {
-                    "accuracy": float(accuracy_score(y_true_bin, y_pred_bin)),
-                    "precision": float(precision_score(y_true_bin, y_pred_bin, average="macro", zero_division=0)),
-                    "recall": float(recall_score(y_true_bin, y_pred_bin, average="macro", zero_division=0)),
-                    "f1_score": float(f1_score(y_true_bin, y_pred_bin, average="macro", zero_division=0)),
-                }
-            )
-            return metrics
-
-        if probs.shape[1] == 2:
-            y_pred = np.argmax(probs, axis=1)
-            y_score = probs[:, 1]
-            metrics.update(
-                {
-                    "accuracy": float(accuracy_score(y_true_array, y_pred)),
-                    "precision": float(precision_score(y_true_array, y_pred, zero_division=0)),
-                    "recall": float(recall_score(y_true_array, y_pred, zero_division=0)),
-                    "f1_score": float(f1_score(y_true_array, y_pred, zero_division=0)),
-                }
-            )
-            unique_classes = np.unique(y_true_array)
-            if unique_classes.size == 2:
-                metrics["roc_auc"] = float(roc_auc_score(y_true_array, y_score))
-                metrics["pr_auc"] = float(average_precision_score(y_true_array, y_score))
-            return metrics
-
-        y_pred = np.argmax(probs, axis=1)
-        metrics.update(
-            {
-                "accuracy": float(accuracy_score(y_true_array, y_pred)),
-                "precision": float(precision_score(y_true_array, y_pred, average="macro", zero_division=0)),
-                "recall": float(recall_score(y_true_array, y_pred, average="macro", zero_division=0)),
-                "f1_score": float(f1_score(y_true_array, y_pred, average="macro", zero_division=0)),
-            }
-        )
-        return metrics
-
-    @staticmethod
-    def _is_legacy_multilabel_target(y_true_array: np.ndarray) -> bool:
-        if y_true_array.dtype != object or y_true_array.size == 0:
-            return False
-        first_value = y_true_array[0]
-        return isinstance(first_value, (list, tuple, set, np.ndarray))
-
-    @staticmethod
-    def _binarize_legacy_multilabel(y_true_array: np.ndarray) -> np.ndarray:
-        def _to_list(item: Any) -> list[Any]:
-            if isinstance(item, np.ndarray):
-                return item.tolist()
-            if isinstance(item, (list, tuple, set)):
-                return list(item)
-            return [item]
-
-        values = [_to_list(item) for item in y_true_array]
-        binarizer = MultiLabelBinarizer()
-        return binarizer.fit_transform(values)
-
-    def _compute_test_metrics(
-        self,
-        model,
-        x_train: np.ndarray,
-        x_test: np.ndarray,
-        y_test: np.ndarray,
-        normalization_mode: str,
-    ) -> dict[str, float]:
-        if model is None or not hasattr(model, "predict_proba"):
-            return {}
-        if x_test.size == 0:
-            return {}
-
-        x_test_processed = self._preprocess_for_inference(x_train=x_train, x_eval=x_test, normalization_mode=normalization_mode)
-        test_probs = np.asarray(model.predict_proba(x_test_processed))
-        return self._compute_metrics(np.asarray(y_test), test_probs)
-
-    def _export_trial_results_csv(self, output_path: Path, trial_results: list[dict[str, Any]]) -> None:
-        rows: list[dict[str, Any]] = []
-        for result in trial_results:
-            config_values = self._flatten_dict(result.get("config", {}))
-            val_metrics = result.get("validation_metrics", {})
-            test_metrics = result.get("test_metrics", {})
-            row = {
-                "model_type": result.get("model_type"),
-                "embedding_name": result.get("embedding_name"),
-                "trial_index": result.get("trial_index"),
-                "selection_metric_name": result.get("selection_metric_name"),
-                "selection_metric_value": result.get("selection_metric_value"),
-                **{f"config.{key}": value for key, value in config_values.items()},
-                **{f"val_{key}": value for key, value in val_metrics.items()},
-                **{f"test_{key}": value for key, value in test_metrics.items()},
-            }
-            rows.append(row)
-
-        if not rows:
+    def _wandb_update_summary(run, validation_metrics: dict[str, Any], test_metrics: dict[str, Any] | None) -> None:
+        if run is None:
             return
 
-        fieldnames = sorted({key for row in rows for key in row.keys()})
-        with output_path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
+        summary = getattr(run, "summary", None)
+        if summary is None:
+            return
+
+        if "f1" in validation_metrics:
+            summary["val_f1"] = float(validation_metrics["f1"])
+        elif "macro_f1" in validation_metrics:
+            summary["val_f1"] = float(validation_metrics["macro_f1"])
+
+        for key, value in validation_metrics.items():
+            summary[f"val_{key}"] = value
+
+        if test_metrics is not None:
+            for key, value in test_metrics.items():
+                summary[f"test_{key}"] = value
 
     @staticmethod
-    def build_summary_table(trial_results: list[dict[str, Any]], model_order: list[str]) -> str:
-        if not trial_results:
-            header = ["Embedding", *model_order]
-            return " | ".join(header)
-
-        by_embedding_model: dict[str, dict[str, float]] = {}
-        for row in trial_results:
-            embedding = str(row.get("embedding_name"))
-            model_type = str(row.get("model_type"))
-            val_metrics = row.get("validation_metrics", {})
-            value = val_metrics.get("f1_score") if isinstance(val_metrics, Mapping) else None
-            if value is None or not np.isfinite(value):
-                continue
-            by_embedding_model.setdefault(embedding, {})
-            current = by_embedding_model[embedding].get(model_type)
-            if current is None or value > current:
-                by_embedding_model[embedding][model_type] = float(value)
-
-        header = ["Embedding", *model_order]
-        lines = [" | ".join(header), "-" * (len(" | ".join(header)) + 8)]
-        for embedding in sorted(by_embedding_model.keys()):
-            row_values = [embedding]
-            for model in model_order:
-                score = by_embedding_model[embedding].get(model)
-                row_values.append("-" if score is None else f"{score:.4f}")
-            lines.append(" | ".join(row_values))
-        return "\n".join(lines)
-
-    @staticmethod
-    def _wandb_init(wandb_project: str, config: dict[str, Any], trial_index: int, run_name: str):
-        try:
-            import wandb
-        except ImportError:
-            return None
-        return wandb.init(project=wandb_project, config=config, name=run_name)
+    def _wandb_finish(run) -> None:
+        if run is None:
+            return
+        run.finish()

@@ -1,0 +1,22 @@
+wandb:
+  enabled: true
+  mode: offline
+  project: protein-embedding-classifier
+  entity: null
+
+embedding_groups:
+  sentence:
+    - ESM2
+    - ProtT5
+  graph:
+    - GeOKG
+
+sweep:
+  enabled_classifiers: []
+
+final_training:
+  enabled: true
+  retrain_on_train_val: true
+  evaluate_test: true
+  save_model: true
+  output_dir: artifacts/final_models

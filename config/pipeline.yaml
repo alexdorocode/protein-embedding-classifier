@@ -164,6 +164,8 @@ dataset:
     # fold_index: 0
     # random_state: 42
 
+training_config_path: config/training/training_config.yaml
+
 ################################################################################
 # Optional top-level sections for future steps (embeddings/train/sweep/...)
 # are allowed and will be passed to their step handlers when implemented.

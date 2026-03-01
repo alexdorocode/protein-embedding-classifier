@@ -3,6 +3,7 @@ import pytest
 
 from protein_embedding_classifier.core.embedding_loading import (
     EmbeddingBundle,
+    GOEmbeddingLoader,
     LayerAggregationStrategy,
 )
 from protein_embedding_classifier.data.dataset_builder import DatasetBundle
@@ -95,3 +96,39 @@ def test_embedding_bundle_raises_on_missing_embeddings():
 
     with pytest.raises(ValueError, match="Missing embeddings"):
         EmbeddingBundle.from_dataset(dataset_bundle, raw_embeddings)
+
+
+def test_go_embedding_loader_returns_geokg_view(tmp_path):
+    go_dir = tmp_path / "go"
+    go_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_bp = go_dir / "bp.csv"
+    csv_mf = go_dir / "mf.csv"
+    csv_cc = go_dir / "cc.csv"
+
+    csv_bp.write_text('UniProt_ID,gope\nP1,"[0.1, 0.2]"\n', encoding="utf-8")
+    csv_mf.write_text('UniProt_ID,gope\nP1,"[0.3, 0.4]"\n', encoding="utf-8")
+    csv_cc.write_text('UniProt_ID,gope\nP1,"[0.5, 0.6]"\n', encoding="utf-8")
+
+    loader = GOEmbeddingLoader()
+    result = loader.load(
+        {
+            "GOPE": {
+                "enabled": True,
+                "file_info": {
+                    "folder": str(go_dir),
+                    "file_name_BP": "bp.csv",
+                    "file_name_MF": "mf.csv",
+                    "file_name_CC": "cc.csv",
+                    "accession_column": "UniProt_ID",
+                    "embedding_column": "gope",
+                },
+                "models": {"GeOKG": {"enabled": True}},
+            }
+        },
+        accessions=["P1"],
+    )
+
+    assert "GeOKG" in result
+    assert "P1" in result["GeOKG"]
+    assert result["GeOKG"]["P1"].shape == (6,)
