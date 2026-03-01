@@ -138,6 +138,63 @@ def test_training_service_handles_multilabel_targets():
     assert "macro_f1" in payload["metrics"]["validation"]
 
 
+def test_training_service_allows_mlp_with_multilabel_when_model_supports_it(monkeypatch):
+    class FakeMultilabelMLP:
+        def fit(self, X_train, y_train, X_val, y_val):
+            self._output_dim = y_train.shape[1]
+
+        def predict_proba(self, X):
+            return np.full((X.shape[0], self._output_dim), 0.5, dtype=np.float32)
+
+    class FakeModelFactory:
+        def create(self, model_type, params=None, input_size=None, output_size=None):
+            assert model_type == "MLP"
+            return FakeMultilabelMLP()
+
+    bundle = EmbeddingBundle(
+        X_train={"ESM3c": np.random.randn(8, 6).astype(np.float32)},
+        X_val={"ESM3c": np.random.randn(4, 6).astype(np.float32)},
+        X_test={"ESM3c": np.random.randn(4, 6).astype(np.float32)},
+        y_train=np.array([
+            ["GO:1", "GO:2"],
+            ["GO:2"],
+            ["GO:1"],
+            ["GO:3"],
+            ["GO:1", "GO:3"],
+            ["GO:2", "GO:3"],
+            ["GO:1"],
+            ["GO:2"],
+        ], dtype=object),
+        y_val=np.array([
+            ["GO:1"],
+            ["GO:2", "GO:3"],
+            ["GO:3"],
+            ["GO:1", "GO:2"],
+        ], dtype=object),
+        y_test=np.array([
+            ["GO:1"],
+            ["GO:2"],
+            ["GO:3"],
+            ["GO:1", "GO:3"],
+        ], dtype=object),
+    )
+
+    service = TrainingService(model_factory=FakeModelFactory())
+    results = service.train(
+        embedding_bundle=bundle,
+        training_config={
+            "model_types": ["MLP"],
+            "model_params": {"MLP": {}},
+            "evaluate_test": True,
+        },
+    )
+
+    payload = results[("MLP", "ESM3c")]
+    assert payload["val_probs"].shape == (4, 3)
+    assert "macro_f1" in payload["metrics"]["validation"]
+    assert payload["metrics"]["test"] is not None
+
+
 def test_training_service_l2_normalization_rowwise_unit_norm():
     factory = DummyModelFactory()
     service = TrainingService(model_factory=factory)

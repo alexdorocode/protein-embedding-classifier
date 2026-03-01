@@ -17,7 +17,9 @@ from sklearn.metrics import (
 from sklearn.multiclass import OneVsRestClassifier
 from sklearn.preprocessing import MultiLabelBinarizer, StandardScaler, normalize
 
+from protein_embedding_classifier.core.decision.decision_policy import decide
 from protein_embedding_classifier.core.embedding_loading import EmbeddingBundle
+from protein_embedding_classifier.core.probability.probability_adapter import ProbabilityAdapter
 from protein_embedding_classifier.core.training.model_factory import ModelFactory
 from protein_embedding_classifier.core.training.problem_specification import ProblemSpecification
 
@@ -76,6 +78,7 @@ class TrainingService:
                 params = self._resolve_params(model_type=model_type, model_params=model_params)
                 if model_type.upper() == "MLP" and "criterion_name" not in params:
                     params["criterion_name"] = problem_spec.loss_name
+                threshold_policy = self._resolve_threshold_policy(config, model_type, embedding_name)
 
                 self.logger.info(
                     "Training model_type=%s embedding=%s train_shape=%s val_shape=%s",
@@ -95,17 +98,30 @@ class TrainingService:
                 if problem_spec.problem_type == "multilabel" and model_type.upper() != "MLP":
                     model = OneVsRestClassifier(model)
 
-                if hasattr(model, "fit") and hasattr(model, "predict_proba") and model_type.upper() != "MLP":
-                    model.fit(x_train_processed, y_train_processed)
-                    val_probs = model.predict_proba(x_val_processed)
-                else:
-                    if problem_spec.problem_type == "multilabel":
+                if model_type.upper() != "MLP":
+                    if not hasattr(model, "predict_proba"):
                         raise ValueError(
-                            "MLP training is not supported for multilabel targets in this pipeline "
-                            "(MLP is supported for binary and multiclass tasks)."
+                            f"model_type={model_type} does not expose predict_proba required for probability-based pipeline"
                         )
-                    model.fit(x_train_processed, y_train, x_val_processed, y_val)
-                    val_probs = model.predict_proba(x_val_processed)
+                    model.fit(x_train_processed, y_train_processed)
+                    raw_val_probs = model.predict_proba(x_val_processed)
+                else:
+                    if not hasattr(model, "predict_proba"):
+                        raise ValueError(
+                            f"model_type={model_type} does not expose predict_proba required for probability-based pipeline"
+                        )
+                    y_train_for_mlp = y_train_processed if problem_spec.problem_type == "multilabel" else y_train
+                    y_val_for_mlp = y_val_processed if problem_spec.problem_type == "multilabel" else y_val
+                    model.fit(x_train_processed, y_train_for_mlp, x_val_processed, y_val_for_mlp)
+                    raw_val_probs = model.predict_proba(x_val_processed)
+
+                model_classes = getattr(model, "classes_", problem_spec.classes)
+                val_probs = ProbabilityAdapter.to_canonical(
+                    raw_output=raw_val_probs,
+                    problem_type=problem_spec.problem_type,
+                    classes=model_classes,
+                    context=f"{model_type}/{embedding_name}/val",
+                )
 
                 validation_metrics = self._compute_metrics(
                     y_true=y_val_processed if problem_spec.problem_type == "multilabel" else y_val,
@@ -113,11 +129,18 @@ class TrainingService:
                     problem_spec=problem_spec,
                     metrics_average=metrics_average,
                     class_labels=getattr(model, "classes_", None),
+                    threshold_config=threshold_policy,
                 )
 
                 test_metrics: dict[str, Any] | None = None
                 if evaluate_test and hasattr(model, "predict_proba"):
-                    test_probs = model.predict_proba(x_test_processed)
+                    raw_test_probs = model.predict_proba(x_test_processed)
+                    test_probs = ProbabilityAdapter.to_canonical(
+                        raw_output=raw_test_probs,
+                        problem_type=problem_spec.problem_type,
+                        classes=model_classes,
+                        context=f"{model_type}/{embedding_name}/test",
+                    )
                     y_test_true = (
                         self._transform_multilabel_with_binarizer(embedding_bundle.y_test, multilabel_binarizer)
                         if problem_spec.problem_type == "multilabel"
@@ -129,6 +152,7 @@ class TrainingService:
                         problem_spec=problem_spec,
                         metrics_average=metrics_average,
                         class_labels=getattr(model, "classes_", None),
+                        threshold_config=threshold_policy,
                     )
 
                 val_f1 = float(
@@ -219,6 +243,7 @@ class TrainingService:
         problem_spec: ProblemSpecification,
         metrics_average: str,
         class_labels: np.ndarray | None,
+        threshold_config: dict[str, Any] | Mapping[str, Any] | None,
     ) -> dict[str, Any]:
         y_true_array = np.asarray(y_true)
         probs_array = np.asarray(probs)
@@ -226,18 +251,20 @@ class TrainingService:
         metrics: dict[str, Any] = {}
 
         if problem_spec.problem_type == "multilabel":
-            y_pred = (probs_array >= 0.5).astype(int)
+            y_pred = decide(probs_array, problem_spec.problem_type, threshold_config)
             metrics["micro_f1"] = float(f1_score(y_true_array, y_pred, average="micro", zero_division=0))
             metrics["macro_f1"] = float(f1_score(y_true_array, y_pred, average="macro", zero_division=0))
             metrics["f1"] = float(metrics["macro_f1"])
             return metrics
 
-        y_pred = self._probs_to_predictions(
-            model=None,
-            val_probs=probs_array,
-            problem_spec=problem_spec,
-            class_labels=class_labels,
-        )
+        y_pred = decide(probs_array, problem_spec.problem_type, threshold_config)
+        if class_labels is not None and y_pred.ndim == 1:
+            class_array = np.asarray(class_labels)
+            if class_array.size > 0 and np.issubdtype(y_pred.dtype, np.integer):
+                min_index = int(np.min(y_pred)) if y_pred.size else 0
+                max_index = int(np.max(y_pred)) if y_pred.size else -1
+                if min_index >= 0 and max_index < len(class_array):
+                    y_pred = class_array[y_pred]
 
         metrics["accuracy"] = float(accuracy_score(y_true_array, y_pred))
         if problem_spec.problem_type == "binary":
@@ -261,24 +288,16 @@ class TrainingService:
         return metrics
 
     @staticmethod
-    def _probs_to_predictions(
-        model,
-        val_probs: np.ndarray,
-        problem_spec: ProblemSpecification,
-        class_labels: np.ndarray | None = None,
-    ) -> np.ndarray:
-        if problem_spec.problem_type == "multilabel":
-            return (np.asarray(val_probs) >= 0.5).astype(int)
-
-        if class_labels is None and model is not None:
-            class_labels = getattr(model, "classes_", None)
-        pred_index = np.argmax(val_probs, axis=1)
-
-        if class_labels is not None:
-            class_array = np.asarray(class_labels)
-            return class_array[pred_index]
-
-        return pred_index
+    def _resolve_threshold_policy(
+        config: dict[str, Any],
+        model_type: str,
+        embedding_name: str,
+    ) -> dict[str, Any]:
+        threshold_policy = config.get("threshold_policy", {})
+        resolved = dict(threshold_policy) if isinstance(threshold_policy, Mapping) else {}
+        resolved["classifier_name"] = model_type
+        resolved["embedding_name"] = embedding_name
+        return resolved
 
     @staticmethod
     def _prepare_labels(

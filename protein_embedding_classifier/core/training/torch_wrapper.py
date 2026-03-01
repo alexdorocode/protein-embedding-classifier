@@ -64,9 +64,23 @@ class TorchTrainingWrapper:
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        y_train_enc = self.label_encoder.fit_transform(np.asarray(y_train))
-        y_val_enc = self.label_encoder.transform(np.asarray(y_val))
-        self.classes_ = self.label_encoder.classes_
+        y_train_array = np.asarray(y_train)
+        y_val_array = np.asarray(y_val)
+        is_multilabel_targets = y_train_array.ndim == 2
+
+        if is_multilabel_targets:
+            y_train_enc = y_train_array.astype(np.float32)
+            y_val_enc = y_val_array.astype(np.float32)
+            self.classes_ = np.arange(y_train_enc.shape[1])
+            if self.criterion_name != "BCEWithLogitsLoss":
+                raise ValueError(
+                    "Multilabel targets require BCEWithLogitsLoss, "
+                    f"got criterion_name={self.criterion_name}"
+                )
+        else:
+            y_train_enc = self.label_encoder.fit_transform(y_train_array)
+            y_val_enc = self.label_encoder.transform(y_val_array)
+            self.classes_ = self.label_encoder.classes_
 
         inferred_input_size = self.input_size if self.input_size is not None else int(X_train.shape[1])
         inferred_output_size = self.output_size if self.output_size is not None else int(len(self.classes_))
@@ -97,8 +111,12 @@ class TorchTrainingWrapper:
 
         x_train_tensor = torch.tensor(X_train, dtype=torch.float32)
         x_val_tensor = torch.tensor(X_val, dtype=torch.float32)
-        y_train_tensor = torch.tensor(y_train_enc, dtype=torch.long)
-        y_val_tensor = torch.tensor(y_val_enc, dtype=torch.long)
+        if is_multilabel_targets:
+            y_train_tensor = torch.tensor(y_train_enc, dtype=torch.float32)
+            y_val_tensor = torch.tensor(y_val_enc, dtype=torch.float32)
+        else:
+            y_train_tensor = torch.tensor(y_train_enc, dtype=torch.long)
+            y_val_tensor = torch.tensor(y_val_enc, dtype=torch.long)
 
         dataset = torch.utils.data.TensorDataset(x_train_tensor, y_train_tensor)
         train_loader = torch.utils.data.DataLoader(dataset, batch_size=int(self.batch_size), shuffle=True)
@@ -165,6 +183,9 @@ class TorchTrainingWrapper:
                 probs = np.hstack([negative_prob, positive_prob])
                 return probs.astype(np.float32)
 
+            if self.criterion_name == "BCEWithLogitsLoss":
+                return torch.sigmoid(logits).cpu().numpy().astype(np.float32)
+
             probs = torch.softmax(logits, dim=1).cpu().numpy().astype(np.float32)
             return probs
 
@@ -199,6 +220,8 @@ class TorchTrainingWrapper:
             return criterion(logits, y_batch)
 
         if self.criterion_name == "BCEWithLogitsLoss":
+            if y_batch.ndim == 2:
+                return criterion(logits, y_batch.float())
             one_hot = torch.nn.functional.one_hot(y_batch, num_classes=num_classes).float()
             return criterion(logits, one_hot)
 

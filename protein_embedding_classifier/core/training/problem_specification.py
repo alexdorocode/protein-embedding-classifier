@@ -15,7 +15,7 @@ class ProblemSpecification:
 
     @classmethod
     def from_labels(cls, labels: np.ndarray) -> ProblemSpecification:
-        values = np.asarray(labels, dtype=object)
+        values = cls._normalize_singleton_iterables(np.asarray(labels, dtype=object))
         if values.size == 0:
             raise ValueError("Cannot infer ProblemSpecification from empty labels")
 
@@ -24,8 +24,10 @@ class ProblemSpecification:
             for item in values:
                 if isinstance(item, np.ndarray):
                     flat_labels.extend(item.tolist())
-                else:
+                elif isinstance(item, (list, tuple, set)):
                     flat_labels.extend(list(item))
+                else:
+                    flat_labels.append(item)
             classes = tuple(sorted(set(flat_labels)))
             return cls(
                 problem_type="multilabel",
@@ -52,4 +54,40 @@ class ProblemSpecification:
 
     @staticmethod
     def _is_multilabel(values: np.ndarray) -> bool:
-        return any(isinstance(item, (list, tuple, set, np.ndarray)) for item in values)
+        for item in values:
+            if not isinstance(item, (list, tuple, set, np.ndarray)):
+                continue
+
+            if isinstance(item, np.ndarray):
+                flattened = item.reshape(-1)
+                if flattened.size > 1:
+                    return True
+                continue
+
+            if len(item) > 1:
+                return True
+
+        return False
+
+    @staticmethod
+    def _normalize_singleton_iterables(values: np.ndarray) -> np.ndarray:
+        normalized: list[Any] = []
+        for item in values:
+            if isinstance(item, np.ndarray):
+                flattened = item.reshape(-1)
+                if flattened.size == 1:
+                    normalized.append(flattened[0])
+                else:
+                    normalized.append(item)
+                continue
+
+            if isinstance(item, (list, tuple, set)):
+                if len(item) == 1:
+                    normalized.append(next(iter(item)))
+                else:
+                    normalized.append(item)
+                continue
+
+            normalized.append(item)
+
+        return np.asarray(normalized, dtype=object)

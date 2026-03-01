@@ -129,6 +129,7 @@ def test_final_training_writes_result_and_model(monkeypatch, tmp_path):
 
 def test_run_sweep_step_returns_cleanly_when_all_classifiers_skipped(monkeypatch, caplog, tmp_path):
     pipeline = Pipeline(config_path="config/pipeline.yaml")
+    caplog.set_level("INFO")
 
     bundle = EmbeddingBundle(
         X_train={"ESM3c": np.random.randn(6, 4).astype(np.float32)},
@@ -139,7 +140,20 @@ def test_run_sweep_step_returns_cleanly_when_all_classifiers_skipped(monkeypatch
         y_test=np.array([0, 1, 0]),
     )
 
-    monkeypatch.setattr(Pipeline, "_build_embedding_bundle", lambda self, dataset_conf, embeddings_conf: bundle)
+    class FakeDatasetBundle:
+        train_ids = ["A", "B", "C", "D", "E", "F"]
+        val_ids = ["G", "H", "I"]
+        test_ids = ["J", "K", "L"]
+        y_train = np.array([0, 1, 0, 1, 0, 1])
+        y_val = np.array([0, 1, 0])
+        y_test = np.array([0, 1, 0])
+
+    monkeypatch.setattr(Pipeline, "_build_dataset_bundle", staticmethod(lambda conf: FakeDatasetBundle()))
+    monkeypatch.setattr(
+        Pipeline,
+        "_build_embedding_bundle_from_dataset",
+        lambda self, dataset_bundle, dataset_conf, embeddings_conf: bundle,
+    )
     monkeypatch.setattr(Pipeline, "_load_yaml", staticmethod(lambda path: {}))
     monkeypatch.setattr(Pipeline, "_load_training_config", staticmethod(lambda conf: {"final_training": {"enabled": False}}))
     monkeypatch.setattr(Pipeline, "_resolve_classifier_sweeps", staticmethod(lambda conf: {"MLP": "dummy.yaml"}))
@@ -147,7 +161,7 @@ def test_run_sweep_step_returns_cleanly_when_all_classifiers_skipped(monkeypatch
     from protein_embedding_classifier.core.training.sweep_service import SweepService
 
     def fake_run(self, **kwargs):
-        raise ValueError("MLP training is not supported for multilabel targets in this pipeline")
+        raise ImportError("MLP model requested but torch is not installed")
 
     monkeypatch.setattr(SweepService, "run", fake_run)
 
@@ -163,4 +177,89 @@ def test_run_sweep_step_returns_cleanly_when_all_classifiers_skipped(monkeypatch
 
     pipeline.run_sweep_step(conf)
 
-    assert "No successful sweep results were produced" in caplog.text
+    assert "No successful sweep results were produced; all selected classifiers were skipped" in caplog.text
+
+
+def test_final_training_continues_when_model_pickle_fails(monkeypatch, caplog, tmp_path):
+    pipeline = Pipeline(config_path="config/pipeline.yaml")
+    caplog.set_level("WARNING")
+
+    bundle = EmbeddingBundle(
+        X_train={"ESM2": np.random.randn(6, 4).astype(np.float32)},
+        X_val={"ESM2": np.random.randn(3, 4).astype(np.float32)},
+        X_test={"ESM2": np.random.randn(3, 4).astype(np.float32)},
+        y_train=np.array([0, 1, 0, 1, 0, 1]),
+        y_val=np.array([0, 1, 0]),
+        y_test=np.array([0, 1, 0]),
+    )
+
+    class UnpicklableModel:
+        def __getstate__(self):
+            raise TypeError("cannot pickle")
+
+    def fake_train(self, embedding_bundle, training_config):
+        embedding_name = next(iter(embedding_bundle.X_train.keys()))
+        return {
+            ("MLP", embedding_name): {
+                "model": UnpicklableModel(),
+                "metrics": {
+                    "validation": {"f1": 0.6},
+                    "test": {"f1": 0.55},
+                },
+            }
+        }
+
+    from protein_embedding_classifier.core.training.training_service import TrainingService
+
+    monkeypatch.setattr(TrainingService, "train", fake_train)
+    monkeypatch.setattr(Pipeline, "_wandb_init_run", staticmethod(lambda **kwargs: None))
+    monkeypatch.setattr(Pipeline, "_wandb_log", staticmethod(lambda payload: None))
+    monkeypatch.setattr(Pipeline, "_wandb_finish_run", staticmethod(lambda run: None))
+
+    rows = pipeline._run_final_training_for_classifier(
+        classifier="MLP",
+        trial_results=[
+            {
+                "embedding_name": "ESM2",
+                "config": {"learning_rate": 1e-3},
+                "validation_metrics": {"f1": 0.7},
+            }
+        ],
+        embedding_bundle=bundle,
+        train_conf={},
+        final_training_conf={
+            "retrain_on_train_val": True,
+            "evaluate_test": True,
+            "save_model": True,
+            "output_dir": str(tmp_path / "models"),
+        },
+        wandb_enabled=False,
+        wandb_mode="offline",
+        wandb_project="pec-test",
+        wandb_entity=None,
+    )
+
+    assert len(rows) == 1
+    assert "Skipping model artifact save" in caplog.text
+
+
+def test_reporting_config_defaults_applied():
+    conf = Pipeline._build_reporting_config({})
+
+    assert conf["output_root"] == "../../pec_data"
+    assert conf["run_prefix"] == "sweep"
+    assert conf["dataset_name"] == "default_dataset"
+    assert conf["prediction_split"] == "test"
+    assert conf["thresholds"]["default"] == 0.5
+
+
+def test_create_timestamped_run_dir_adds_suffix_on_collision(tmp_path):
+    base = tmp_path / "sweep"
+    base.mkdir(parents=True, exist_ok=True)
+
+    first = Pipeline._create_timestamped_run_dir(base, "run")
+    second = Pipeline._create_timestamped_run_dir(base, "run")
+
+    assert first.exists()
+    assert second.exists()
+    assert first != second

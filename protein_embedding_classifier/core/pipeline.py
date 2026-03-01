@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import pickle
 from pathlib import Path
@@ -8,11 +9,18 @@ from collections.abc import Mapping
 from typing import Any, Callable
 from datetime import datetime
 import numpy as np
+import subprocess
+import sys
+import time
+from importlib import metadata as importlib_metadata
 
 import yaml
+from sklearn.metrics import confusion_matrix
 
+from protein_embedding_classifier.core.decision.decision_policy import decide
 from protein_embedding_classifier.core.db import create_engine_from_config, load_db_config
 from protein_embedding_classifier.core.embedding_loading import EmbeddingBundle, EmbeddingService
+from protein_embedding_classifier.core.probability.probability_adapter import ProbabilityAdapter
 from protein_embedding_classifier.core.training.problem_specification import ProblemSpecification
 from protein_embedding_classifier.core.training.sweep_service import SweepService
 from protein_embedding_classifier.core.training.training_service import TrainingService
@@ -34,11 +42,20 @@ class Pipeline:
         self.config_path = config_path
         self.logger = logging.getLogger("Pipeline")
         self.runtime_filters: dict[str, Any] = {}
+        self.runtime_context: dict[str, Any] = {}
+        self._active_log_handler = None
 
-    def run(self, step: str | None = None, run_all: bool = False, filters: dict[str, Any] | None = None) -> None:
+    def run(
+        self,
+        step: str | None = None,
+        run_all: bool = False,
+        filters: dict[str, Any] | None = None,
+        runtime_context: dict[str, Any] | None = None,
+    ) -> None:
         self.logger.info("Step 1: Load pipeline config")
         conf = self._load_yaml(self.config_path)
         self.runtime_filters = {key: value for key, value in (filters or {}).items() if value is not None}
+        self.runtime_context = dict(runtime_context or {})
 
         self.logger.info("Step 2: Resolve execution plan")
         if run_all:
@@ -198,6 +215,7 @@ class Pipeline:
         embeddings_conf = self._load_yaml(embeddings_config_path)
         embedding_bundle = self._build_embedding_bundle(dataset_conf=dataset_conf, embeddings_conf=embeddings_conf)
         training_global_conf = self._load_training_config(pipeline_conf)
+        threshold_policy = training_global_conf.get("reporting", {}).get("thresholds", {})
         selected_embeddings = self._resolve_selected_embeddings(
             available=list(embedding_bundle.X_train.keys()),
             filters=self.runtime_filters,
@@ -216,7 +234,10 @@ class Pipeline:
         service = TrainingService()
         results = service.train(
             embedding_bundle=embedding_bundle,
-            training_config=dict(train_conf),
+            training_config={
+                **dict(train_conf),
+                "threshold_policy": threshold_policy,
+            },
         )
 
         artifacts_dir = Path(str(train_conf.get("artifacts_dir", "artifacts")))
@@ -242,11 +263,32 @@ class Pipeline:
         embeddings_step_conf = pipeline_conf.get("embeddings", {})
         train_conf = pipeline_conf.get("train", {})
         sweep_conf = pipeline_conf.get("sweep", {})
+        training_global_conf = self._load_training_config(pipeline_conf)
+        reporting_conf = self._build_reporting_config(training_global_conf)
+
+        path_layout = self._ensure_pec_data_layout(reporting_conf)
+        run_prefix = str(self.runtime_context.get("run_prefix") or reporting_conf.get("run_prefix", "sweep"))
+        run_dir = self._create_timestamped_run_dir(path_layout["sweep"], run_prefix)
+        self._attach_file_logger(path_layout["logs"], run_dir.name)
+
+        run_started_at = datetime.utcnow().isoformat() + "Z"
+        run_started_ts = time.time()
 
         embeddings_config_path = embeddings_step_conf.get("config_path", "config/embeddings.yaml")
         embeddings_conf = self._load_yaml(embeddings_config_path)
-        embedding_bundle = self._build_embedding_bundle(dataset_conf=dataset_conf, embeddings_conf=embeddings_conf)
-        training_global_conf = self._load_training_config(pipeline_conf)
+
+        dataset_bundle = self._build_dataset_bundle(dataset_conf)
+        self._persist_dataset_snapshot_if_missing(
+            dataset_bundle=dataset_bundle,
+            dataset_name=str(reporting_conf.get("dataset_name", "default_dataset")),
+            dataset_dir=path_layout["dataset"],
+        )
+
+        embedding_bundle = self._build_embedding_bundle_from_dataset(
+            dataset_bundle=dataset_bundle,
+            dataset_conf=dataset_conf,
+            embeddings_conf=embeddings_conf,
+        )
 
         selected_embeddings = self._resolve_selected_embeddings(
             available=list(embedding_bundle.X_train.keys()),
@@ -287,7 +329,6 @@ class Pipeline:
             self.logger.info("Sweep mode configured for single classifier model_type=%s", model_type)
 
         best_results: dict[str, dict[str, Any]] = {}
-        global_best: dict[str, Any] | None = None
         all_trial_results: list[dict[str, Any]] = []
         final_test_rows: list[dict[str, Any]] = []
         skipped_classifiers: list[tuple[str, str]] = []
@@ -299,19 +340,6 @@ class Pipeline:
         wandb_project = str(wandb_conf.get("project", wandb_project))
 
         for current_model_type, sweep_config_path in selected_classifier_sweeps.items():
-            if current_model_type.upper() == "MLP" and problem_spec.problem_type == "multilabel":
-                reason = (
-                    "MLP training is not supported for multilabel targets in this pipeline "
-                    "(MLP is supported for binary and multiclass tasks)."
-                )
-                self.logger.warning(
-                    "Skipping classifier sweep model_type=%s due to unsupported model/task combination: %s",
-                    current_model_type,
-                    reason,
-                )
-                skipped_classifiers.append((current_model_type, reason))
-                continue
-
             self.logger.info(
                 "Starting classifier sweep model_type=%s config_path=%s",
                 current_model_type,
@@ -325,7 +353,10 @@ class Pipeline:
                     embedding_bundle=embedding_bundle,
                     sweep_config=sweep_yaml,
                     num_trials=num_trials,
-                    training_config=dict(train_conf),
+                    training_config={
+                        **dict(train_conf),
+                        "threshold_policy": reporting_conf.get("thresholds", {}),
+                    },
                     wandb_project=wandb_project,
                     artifacts_dir=str(artifacts_dir),
                     wandb_enabled=wandb_enabled,
@@ -341,14 +372,6 @@ class Pipeline:
                 skipped_classifiers.append((current_model_type, str(exc)))
                 continue
             except ValueError as exc:
-                if "MLP training is not supported for multilabel targets" in str(exc):
-                    self.logger.warning(
-                        "Skipping classifier sweep model_type=%s due to unsupported model/task combination: %s",
-                        current_model_type,
-                        exc,
-                    )
-                    skipped_classifiers.append((current_model_type, str(exc)))
-                    continue
                 raise
 
             best_results[current_model_type] = {
@@ -357,14 +380,6 @@ class Pipeline:
                 "best_key": result.best_key,
                 "sweep_config_path": sweep_config_path,
             }
-            if global_best is None or result.best_metric > float(global_best["best_metric"]):
-                global_best = {
-                    "model_type": current_model_type,
-                    "embedding_name": result.best_key[1],
-                    "best_metric": result.best_metric,
-                    "best_config": result.best_config,
-                    "sweep_config_path": sweep_config_path,
-                }
             all_trial_results.extend(result.trial_results)
             self.logger.info(
                 "Finished classifier sweep model_type=%s best_embedding=%s validation_f1=%.6f",
@@ -374,12 +389,15 @@ class Pipeline:
             )
 
             if bool(training_global_conf.get("final_training", {}).get("enabled", False)):
+                final_training_conf = dict(training_global_conf.get("final_training", {}))
+                final_training_conf["output_dir"] = str(run_dir / "models")
+                final_training_conf["threshold_policy"] = reporting_conf.get("thresholds", {})
                 final_rows = self._run_final_training_for_classifier(
                     classifier=current_model_type,
                     trial_results=result.trial_results,
                     embedding_bundle=embedding_bundle,
                     train_conf=train_conf,
-                    final_training_conf=dict(training_global_conf.get("final_training", {})),
+                    final_training_conf=final_training_conf,
                     wandb_enabled=wandb_enabled,
                     wandb_mode=wandb_mode,
                     wandb_project=wandb_project,
@@ -390,53 +408,38 @@ class Pipeline:
         if not best_results:
             if skipped_classifiers:
                 skipped_summary = "; ".join(f"{name}: {reason}" for name, reason in skipped_classifiers)
-                only_unsupported_mlp = all(
-                    "MLP training is not supported for multilabel targets" in reason
-                    for _, reason in skipped_classifiers
+                self.logger.warning(
+                    "No successful sweep results were produced; all selected classifiers were skipped. %s",
+                    skipped_summary,
                 )
-                if only_unsupported_mlp:
-                    self.logger.info(
-                        "Sweep completed with no runs because selected classifiers are unsupported for this task. %s",
-                        skipped_summary,
-                    )
-                else:
-                    self.logger.warning(
-                        "No successful sweep results were produced; all selected classifiers were skipped. %s",
-                        skipped_summary,
-                    )
             else:
                 self.logger.warning("No successful sweep results were produced")
             return
 
-        per_classifier_path = artifacts_dir / "best_config_by_classifier.yaml"
+        configs_dir = run_dir / "configs"
+        reports_dir = run_dir / "reports"
+        predictions_dir = run_dir / "predictions"
+        models_dir = run_dir / "models"
+        for folder in (configs_dir, reports_dir, predictions_dir, models_dir):
+            folder.mkdir(parents=True, exist_ok=True)
+
+        per_classifier_path = reports_dir / "best_config_by_classifier.yaml"
         with per_classifier_path.open("w", encoding="utf-8") as handle:
             yaml.safe_dump(best_results, handle, sort_keys=False)
         self.logger.info("Saved per-classifier sweep results artifact: %s", per_classifier_path)
 
-        full_results_csv = artifacts_dir / "sweep_results_full.csv"
+        full_results_csv = reports_dir / "sweep_results_full.csv"
         self._write_full_sweep_results_csv(full_results_csv, all_trial_results)
         self.logger.info("Saved full sweep results CSV artifact: %s", full_results_csv)
 
-        best_per_classifier_csv = artifacts_dir / "best_per_classifier.csv"
+        best_per_classifier_csv = reports_dir / "best_per_classifier.csv"
         self._write_best_per_classifier_csv(best_per_classifier_csv, best_results)
         self.logger.info("Saved per-classifier sweep CSV artifact: %s", best_per_classifier_csv)
 
-        best_config_path = artifacts_dir / "best_config.yaml"
-        with best_config_path.open("w", encoding="utf-8") as handle:
-            yaml.safe_dump((global_best or {}).get("best_config", {}), handle, sort_keys=False)
-
-        self.logger.info("Saved sweep best config artifact: %s", best_config_path)
-        if global_best is not None:
-            global_best_csv = artifacts_dir / "global_best.csv"
-            self._write_global_best_csv(global_best_csv, global_best)
-            self.logger.info("Saved global best CSV artifact: %s", global_best_csv)
-
-            self.logger.info(
-                "Sweep global best result model_type=%s embedding_name=%s validation_f1=%.6f",
-                global_best["model_type"],
-                global_best["embedding_name"],
-                float(global_best["best_metric"]),
-            )
+        best_classifier_per_embedding = self._select_best_classifier_per_embedding(all_trial_results)
+        best_classifier_per_embedding_csv = reports_dir / "best_classifier_per_embedding.csv"
+        self._write_best_classifier_per_embedding_csv(best_classifier_per_embedding_csv, best_classifier_per_embedding)
+        self.logger.info("Saved best classifier per embedding CSV artifact: %s", best_classifier_per_embedding_csv)
 
         summary_table = SweepService.build_summary_table(
             trial_results=all_trial_results,
@@ -445,9 +448,31 @@ class Pipeline:
         self.logger.info("Validation summary table (F1):\n%s", summary_table)
 
         if final_test_rows:
-            final_test_path = artifacts_dir / "final_test_results.csv"
+            final_test_path = reports_dir / "final_test_results.csv"
             self._write_final_test_results_csv(final_test_path, final_test_rows)
             self.logger.info("Saved final test results CSV artifact: %s", final_test_path)
+
+        self._save_run_methodology_snapshot(
+            configs_dir=configs_dir,
+            pipeline_conf=pipeline_conf,
+            training_conf=training_global_conf,
+            sweep_conf=sweep_conf,
+            selected_embeddings=selected_embeddings,
+            selected_classifiers=sorted(selected_classifier_sweeps.keys()),
+            run_started_at=run_started_at,
+            run_duration_seconds=float(time.time() - run_started_ts),
+        )
+
+        predictions_csv = predictions_dir / "predictions_test.csv"
+        self._write_test_predictions_csv(
+            path=predictions_csv,
+            dataset_bundle=dataset_bundle,
+            embedding_bundle=embedding_bundle,
+            final_test_rows=final_test_rows,
+            best_classifier_per_embedding=best_classifier_per_embedding,
+            threshold_conf=reporting_conf.get("thresholds", {}),
+        )
+        self.logger.info("Saved test predictions CSV artifact: %s", predictions_csv)
 
     def run_ensemble_step(self, conf: dict[str, Any]) -> None:
         _ = conf
@@ -455,7 +480,145 @@ class Pipeline:
 
     def run_evaluate_step(self, conf: dict[str, Any]) -> None:
         _ = conf
-        self.logger.info("Evaluate step placeholder (not implemented in this refactor).")
+        if not bool(self.runtime_context.get("evaluate_last_sweep", False)):
+            self.logger.info("Evaluate step placeholder (use --evaluate-last-sweep for fast evaluation mode).")
+            return
+
+        pipeline_conf = self._load_yaml(self.config_path)
+        dataset_conf = pipeline_conf.get("dataset", pipeline_conf)
+        embeddings_step_conf = pipeline_conf.get("embeddings", {})
+        embeddings_config_path = embeddings_step_conf.get("config_path", "config/embeddings.yaml")
+        embeddings_conf = self._load_yaml(embeddings_config_path)
+        training_global_conf = self._load_training_config(pipeline_conf)
+        reporting_conf = self._build_reporting_config(training_global_conf)
+        path_layout = self._ensure_pec_data_layout(reporting_conf)
+
+        latest_run_dir = self._get_latest_sweep_run(path_layout["sweep"])
+        if latest_run_dir is None:
+            raise FileNotFoundError("No previous sweep run found in pec_data/sweep")
+
+        best_csv = latest_run_dir / "reports" / "best_classifier_per_embedding.csv"
+        if not best_csv.exists():
+            raise FileNotFoundError(f"best_classifier_per_embedding.csv not found in {latest_run_dir}")
+
+        best_rows = self._read_best_classifier_per_embedding_csv(best_csv)
+
+        dataset_bundle = self._build_dataset_bundle(dataset_conf)
+        embedding_bundle = self._build_embedding_bundle_from_dataset(
+            dataset_bundle=dataset_bundle,
+            dataset_conf=dataset_conf,
+            embeddings_conf=embeddings_conf,
+        )
+
+        reports_dir = latest_run_dir / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+
+        for row in best_rows:
+            classifier = str(row["model_type"])
+            embedding_name = str(row["embedding_name"])
+            artifact_rel = row.get("artifact_path")
+            serializer = row.get("serializer", "pickle")
+            if not artifact_rel:
+                self.logger.warning(
+                    "Skipping evaluate-last-sweep model_type=%s embedding=%s due to missing artifact path",
+                    classifier,
+                    embedding_name,
+                )
+                continue
+
+            model_path = latest_run_dir / str(artifact_rel)
+            if not model_path.exists() and str(artifact_rel).startswith(f"{latest_run_dir.name}/"):
+                model_path = latest_run_dir / str(artifact_rel).split("/", 1)[1]
+            if not model_path.exists():
+                self.logger.warning(
+                    "Skipping evaluate-last-sweep model_type=%s embedding=%s missing artifact=%s",
+                    classifier,
+                    embedding_name,
+                    model_path,
+                )
+                continue
+
+            model = self._load_model_artifact(model_path=model_path, serializer=serializer)
+            y_train_all = np.asarray(dataset_bundle.y_train, dtype=object)
+            problem_spec = ProblemSpecification.from_labels(y_train_all)
+            problem_type = problem_spec.problem_type
+            if problem_type == "multilabel":
+                self.logger.info(
+                    "Skipping confusion matrix for model_type=%s embedding=%s because problem_type=multilabel",
+                    classifier,
+                    embedding_name,
+                )
+                continue
+
+            x_val = embedding_bundle.X_val[embedding_name]
+            y_val = np.asarray(dataset_bundle.y_val, dtype=object)
+            probs_val = ProbabilityAdapter.to_canonical(
+                raw_output=np.asarray(model.predict_proba(x_val)),
+                problem_type=problem_type,
+                classes=problem_spec.classes,
+                context=f"evaluate/{classifier}/{embedding_name}/validation",
+            )
+            preds_val = decide(
+                probs=probs_val,
+                problem_type=problem_type,
+                threshold_config={
+                    **dict(reporting_conf.get("thresholds", {})),
+                    "classifier_name": classifier,
+                    "embedding_name": embedding_name,
+                },
+            )
+            if problem_type != "multilabel" and len(problem_spec.classes) > 0:
+                preds_val = np.asarray(problem_spec.classes)[preds_val]
+            matrix_val = confusion_matrix(y_val, preds_val)
+            self.logger.info(
+                "Validation confusion matrix model_type=%s embedding=%s:\n%s",
+                classifier,
+                embedding_name,
+                matrix_val,
+            )
+            self._write_confusion_matrix_csv(
+                reports_dir / f"confusion_validation__{classifier}__{embedding_name}.csv",
+                matrix_val,
+            )
+
+            x_full = np.vstack([
+                embedding_bundle.X_train[embedding_name],
+                embedding_bundle.X_val[embedding_name],
+                embedding_bundle.X_test[embedding_name],
+            ])
+            y_full = np.concatenate([
+                np.asarray(dataset_bundle.y_train, dtype=object),
+                np.asarray(dataset_bundle.y_val, dtype=object),
+                np.asarray(dataset_bundle.y_test, dtype=object),
+            ])
+            probs_full = ProbabilityAdapter.to_canonical(
+                raw_output=np.asarray(model.predict_proba(x_full)),
+                problem_type=problem_type,
+                classes=problem_spec.classes,
+                context=f"evaluate/{classifier}/{embedding_name}/full",
+            )
+            preds_full = decide(
+                probs=probs_full,
+                problem_type=problem_type,
+                threshold_config={
+                    **dict(reporting_conf.get("thresholds", {})),
+                    "classifier_name": classifier,
+                    "embedding_name": embedding_name,
+                },
+            )
+            if problem_type != "multilabel" and len(problem_spec.classes) > 0:
+                preds_full = np.asarray(problem_spec.classes)[preds_full]
+            matrix_full = confusion_matrix(y_full, preds_full)
+            self.logger.info(
+                "Full confusion matrix model_type=%s embedding=%s:\n%s",
+                classifier,
+                embedding_name,
+                matrix_full,
+            )
+            self._write_confusion_matrix_csv(
+                reports_dir / f"confusion_full__{classifier}__{embedding_name}.csv",
+                matrix_full,
+            )
 
     def _step_runner_map(self) -> dict[str, Callable[[dict[str, Any]], None]]:
         return {
@@ -484,6 +647,14 @@ class Pipeline:
 
     def _build_embedding_bundle(self, dataset_conf: dict[str, Any], embeddings_conf: dict[str, Any]) -> EmbeddingBundle:
         dataset_bundle = self._build_dataset_bundle(dataset_conf)
+        return self._build_embedding_bundle_from_dataset(dataset_bundle, dataset_conf, embeddings_conf)
+
+    def _build_embedding_bundle_from_dataset(
+        self,
+        dataset_bundle,
+        dataset_conf: dict[str, Any],
+        embeddings_conf: dict[str, Any],
+    ) -> EmbeddingBundle:
         db_conf_path = dataset_conf.get("db_config_path", "config/db.yaml")
         db_conf = load_db_config(db_conf_path)
         engine = create_engine_from_config(db_conf)
@@ -782,6 +953,7 @@ class Pipeline:
 
             x_train = np.vstack([embedding_bundle.X_train[embedding_name], embedding_bundle.X_val[embedding_name]])
             y_train = np.concatenate([np.asarray(embedding_bundle.y_train, dtype=object), np.asarray(embedding_bundle.y_val, dtype=object)])
+            final_problem_spec = ProblemSpecification.from_labels(y_train)
 
             retrain_bundle = EmbeddingBundle(
                 X_train={embedding_name: x_train},
@@ -795,6 +967,7 @@ class Pipeline:
             retrain_conf = dict(train_conf)
             retrain_conf["model_types"] = [classifier]
             retrain_conf["evaluate_test"] = evaluate_test
+            retrain_conf["threshold_policy"] = final_training_conf.get("threshold_policy", {})
             retrain_conf.setdefault("model_params", {})
             retrain_conf["model_params"] = dict(retrain_conf["model_params"])
 
@@ -824,13 +997,33 @@ class Pipeline:
                     "embedding_name": embedding_name,
                     "validation_metrics": dict(validation_metrics),
                     "test_metrics": dict(test_metrics) if test_metrics is not None else None,
+                    "model": result_payload.get("model"),
+                    "classes": getattr(result_payload.get("model"), "classes_", None),
+                    "problem_type": final_problem_spec.problem_type,
                 }
             )
 
             if save_model:
-                model_path = output_dir / f"{classifier}_{embedding_name}.pkl"
-                with model_path.open("wb") as handle:
-                    pickle.dump(result_payload.get("model"), handle)
+                try:
+                    model_info = self._save_model_artifact(
+                        model=result_payload.get("model"),
+                        classifier=classifier,
+                        embedding_name=embedding_name,
+                        output_dir=output_dir,
+                        problem_type=final_problem_spec.problem_type,
+                        classes=final_problem_spec.classes,
+                        normalization_mode=str(retrain_conf.get("feature_processing", {}).get("normalize", "none")),
+                        threshold_policy=retrain_conf.get("threshold_policy", {}),
+                    )
+                    final_rows[-1]["model_artifact"] = model_info
+                except Exception as exc:
+                    self.logger.warning(
+                        "Skipping model artifact save model_type=%s embedding=%s path=%s reason=%s",
+                        classifier,
+                        embedding_name,
+                        output_dir,
+                        exc,
+                    )
 
             if wandb_enabled:
                 run_name = f"final_{classifier}_{embedding_name}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
@@ -888,6 +1081,432 @@ class Pipeline:
                         "test_pr_auc": test_metrics.get("pr_auc", ""),
                     }
                 )
+
+    @staticmethod
+    def _build_reporting_config(training_global_conf: dict[str, Any]) -> dict[str, Any]:
+        default = {
+            "output_root": "../../pec_data",
+            "run_prefix": "sweep",
+            "dataset_name": "default_dataset",
+            "prediction_split": "test",
+            "thresholds": {
+                "default": 0.5,
+                "classifier": {},
+                "classifier_embedding": {},
+            },
+        }
+        configured = training_global_conf.get("reporting", {})
+        if not isinstance(configured, Mapping):
+            return default
+
+        merged = dict(default)
+        merged.update({k: v for k, v in configured.items() if k != "thresholds"})
+        thresholds = dict(default["thresholds"])
+        conf_thresholds = configured.get("thresholds", {})
+        if isinstance(conf_thresholds, Mapping):
+            thresholds.update(conf_thresholds)
+        merged["thresholds"] = thresholds
+        return merged
+
+    @staticmethod
+    def _ensure_pec_data_layout(reporting_conf: dict[str, Any]) -> dict[str, Path]:
+        repo_root = Path(__file__).resolve().parents[2]
+        output_root = (repo_root / str(reporting_conf.get("output_root", "../../pec_data"))).resolve()
+        layout = {
+            "root": output_root,
+            "dataset": output_root / "dataset",
+            "sweep": output_root / "sweep",
+            "results": output_root / "results",
+            "logs": output_root / "logs",
+        }
+        for path in layout.values():
+            path.mkdir(parents=True, exist_ok=True)
+        return layout
+
+    @staticmethod
+    def _create_timestamped_run_dir(base_dir: Path, prefix: str) -> Path:
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        candidate = base_dir / f"{prefix}_{timestamp}"
+        suffix = 1
+        while candidate.exists():
+            candidate = base_dir / f"{prefix}_{timestamp}_{suffix}"
+            suffix += 1
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    def _attach_file_logger(self, logs_dir: Path, run_name: str) -> None:
+        root_logger = logging.getLogger()
+        if self._active_log_handler is not None:
+            root_logger.removeHandler(self._active_log_handler)
+            self._active_log_handler.close()
+            self._active_log_handler = None
+
+        file_path = logs_dir / f"{run_name}.log"
+        handler = logging.FileHandler(file_path, encoding="utf-8")
+        handler.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        root_logger.addHandler(handler)
+        self._active_log_handler = handler
+
+    def _persist_dataset_snapshot_if_missing(self, dataset_bundle, dataset_name: str, dataset_dir: Path) -> None:
+        output_path = dataset_dir / f"{dataset_name}.csv"
+        if output_path.exists():
+            self.logger.info("Dataset snapshot already exists: %s", output_path)
+            return
+
+        rows: list[dict[str, Any]] = []
+        for accession, label in zip(dataset_bundle.train_ids, dataset_bundle.y_train):
+            rows.append({"accession": accession, "label": self._serialize_label(label), "dataset_split": "train"})
+        for accession, label in zip(dataset_bundle.val_ids, dataset_bundle.y_val):
+            rows.append({"accession": accession, "label": self._serialize_label(label), "dataset_split": "val"})
+        for accession, label in zip(dataset_bundle.test_ids, dataset_bundle.y_test):
+            rows.append({"accession": accession, "label": self._serialize_label(label), "dataset_split": "test"})
+
+        with output_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["accession", "label", "dataset_split"])
+            writer.writeheader()
+            writer.writerows(rows)
+
+        self.logger.info("Saved dataset snapshot: %s", output_path)
+
+    @staticmethod
+    def _serialize_label(value: Any) -> str:
+        if isinstance(value, np.ndarray):
+            value = value.tolist()
+        if isinstance(value, (list, tuple, set)):
+            return json.dumps(list(value), ensure_ascii=False)
+        return str(value)
+
+    @staticmethod
+    def _select_best_classifier_per_embedding(trial_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        best: dict[str, dict[str, Any]] = {}
+        for row in trial_results:
+            embedding = str(row.get("embedding_name"))
+            model_type = str(row.get("model_type"))
+            metrics = row.get("validation_metrics", {}) if isinstance(row.get("validation_metrics", {}), Mapping) else {}
+            score = metrics.get("f1", float("nan"))
+            if not isinstance(score, (int, float)) or not np.isfinite(float(score)):
+                continue
+            current = best.get(embedding)
+            if current is None or float(score) > float(current["validation_f1"]):
+                best[embedding] = {
+                    "embedding_name": embedding,
+                    "model_type": model_type,
+                    "validation_f1": float(score),
+                    "config": dict(row.get("config", {})),
+                }
+        return [best[key] for key in sorted(best.keys())]
+
+    @staticmethod
+    def _write_best_classifier_per_embedding_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=["embedding_name", "model_type", "validation_f1", "config", "artifact_path", "serializer"],
+            )
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(
+                    {
+                        "embedding_name": row.get("embedding_name", ""),
+                        "model_type": row.get("model_type", ""),
+                        "validation_f1": row.get("validation_f1", ""),
+                        "config": yaml.safe_dump(row.get("config", {}), sort_keys=True).strip(),
+                        "artifact_path": row.get("artifact_path", ""),
+                        "serializer": row.get("serializer", ""),
+                    }
+                )
+
+    def _save_run_methodology_snapshot(
+        self,
+        configs_dir: Path,
+        pipeline_conf: dict[str, Any],
+        training_conf: dict[str, Any],
+        sweep_conf: dict[str, Any],
+        selected_embeddings: list[str],
+        selected_classifiers: list[str],
+        run_started_at: str,
+        run_duration_seconds: float,
+    ) -> None:
+        metadata = {
+            "run_started_at": run_started_at,
+            "run_duration_seconds": run_duration_seconds,
+            "selected_embeddings": selected_embeddings,
+            "selected_classifiers": selected_classifiers,
+            "runtime_filters": self.runtime_filters,
+            "runtime_context": self.runtime_context,
+            "python_version": sys.version,
+            "git_commit": self._git_commit(),
+            "package_versions": self._package_versions(["numpy", "scikit-learn", "xgboost", "torch", "wandb", "pandas", "pyyaml"]),
+            "argv": self.runtime_context.get("argv", []),
+            "sweep": sweep_conf,
+        }
+
+        with (configs_dir / "resolved_pipeline.yaml").open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(pipeline_conf, handle, sort_keys=False)
+        with (configs_dir / "resolved_training.yaml").open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(training_conf, handle, sort_keys=False)
+        with (configs_dir / "run_metadata.json").open("w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2)
+
+    @staticmethod
+    def _git_commit() -> str | None:
+        try:
+            return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _package_versions(packages: list[str]) -> dict[str, str | None]:
+        versions: dict[str, str | None] = {}
+        for package in packages:
+            try:
+                versions[package] = importlib_metadata.version(package)
+            except Exception:
+                versions[package] = None
+        return versions
+
+    def _write_test_predictions_csv(
+        self,
+        path: Path,
+        dataset_bundle,
+        embedding_bundle: EmbeddingBundle,
+        final_test_rows: list[dict[str, Any]],
+        best_classifier_per_embedding: list[dict[str, Any]],
+        threshold_conf: dict[str, Any],
+    ) -> None:
+        model_lookup: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in final_test_rows:
+            model_lookup[(str(row.get("model_type")), str(row.get("embedding_name")))] = row
+
+        prediction_payloads: dict[tuple[str, str], np.ndarray] = {}
+        for choice in best_classifier_per_embedding:
+            classifier = str(choice.get("model_type"))
+            embedding_name = str(choice.get("embedding_name"))
+            key = (classifier, embedding_name)
+            payload = model_lookup.get(key)
+            if payload is None:
+                continue
+            model = payload.get("model")
+            if model is None:
+                continue
+            probs = ProbabilityAdapter.to_canonical(
+                raw_output=np.asarray(model.predict_proba(embedding_bundle.X_test[embedding_name])),
+                problem_type=str(payload.get("problem_type", "binary")),
+                classes=payload.get("classes"),
+                context=f"predictions/{classifier}/{embedding_name}/test",
+            )
+            preds = decide(
+                probs=probs,
+                problem_type=str(payload.get("problem_type", "binary")),
+                threshold_config={
+                    **dict(threshold_conf if isinstance(threshold_conf, Mapping) else {}),
+                    "classifier_name": classifier,
+                    "embedding_name": embedding_name,
+                },
+            )
+            if str(payload.get("problem_type", "binary")) != "multilabel" and payload.get("classes") is not None:
+                class_array = np.asarray(payload.get("classes"))
+                if class_array.size > 0:
+                    preds = class_array[np.asarray(preds, dtype=int)]
+            prediction_payloads[key] = preds
+
+            artifact = payload.get("model_artifact")
+            if isinstance(artifact, Mapping):
+                choice["artifact_path"] = artifact.get("path", "")
+                choice["serializer"] = artifact.get("serializer", "")
+
+        self._write_best_classifier_per_embedding_csv(path.parent.parent / "reports" / "best_classifier_per_embedding.csv", best_classifier_per_embedding)
+
+        rows: list[dict[str, Any]] = []
+        for index, accession in enumerate(dataset_bundle.test_ids):
+            row = {
+                "accession": accession,
+                "dataset_split": "test",
+                "true_label": self._serialize_label(dataset_bundle.y_test[index]),
+            }
+
+            for choice in best_classifier_per_embedding:
+                classifier = str(choice.get("model_type"))
+                embedding_name = str(choice.get("embedding_name"))
+                col_key = f"{classifier}__{embedding_name}"
+                preds = prediction_payloads.get((classifier, embedding_name))
+                if preds is None:
+                    row[f"pred_{col_key}"] = ""
+                    row[f"missing_reason_{col_key}"] = "model_not_available"
+                    continue
+                pred_value = preds[index]
+                row[f"pred_{col_key}"] = self._serialize_label(pred_value)
+                row[f"missing_reason_{col_key}"] = ""
+
+            rows.append(row)
+
+        fieldnames = sorted({key for row in rows for key in row.keys()})
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    @staticmethod
+    def _save_model_artifact(
+        model: Any,
+        classifier: str,
+        embedding_name: str,
+        output_dir: Path,
+        problem_type: str,
+        classes: tuple[Any, ...] | list[Any] | np.ndarray,
+        normalization_mode: str,
+        threshold_policy: dict[str, Any] | Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        base_name = f"{classifier}_{embedding_name}"
+        classes_list = np.asarray(classes, dtype=object).tolist()
+        metadata_path = output_dir / f"{base_name}.metadata.json"
+
+        metadata: dict[str, Any] = {
+            "problem_type": problem_type,
+            "classes": classes_list,
+            "num_classes": len(classes_list),
+            "normalization": normalization_mode,
+            "threshold_policy": dict(threshold_policy) if isinstance(threshold_policy, Mapping) else {},
+            "classifier": classifier,
+            "embedding_name": embedding_name,
+        }
+
+        if classifier.upper() == "MLP":
+            torch = model._torch if hasattr(model, "_torch") else None
+            if torch is None or model.model is None:
+                raise RuntimeError("MLP model is not initialized for state_dict export")
+
+            model_path = output_dir / f"{base_name}.pt"
+            torch.save(model.model.state_dict(), model_path)
+
+            metadata.update(
+                {
+                    "serializer": "mlp_state_dict",
+                    "mlp": {
+                        "input_size": model.input_size,
+                        "output_size": model.output_size,
+                        "hidden_layers_mode": model.hidden_layers_mode,
+                        "num_hidden_layers": model.num_hidden_layers,
+                        "custom_hidden_layers": model.custom_hidden_layers,
+                        "dropout_rate": model.dropout_rate,
+                        "activation_function": model.activation_function,
+                        "use_batch_norm": model.use_batch_norm,
+                        "output_activation": model.output_activation,
+                        "initialization": model.initialization,
+                        "optimizer_name": model.optimizer_name,
+                        "learning_rate": model.learning_rate,
+                        "num_epochs": model.num_epochs,
+                        "early_stopping_patience": model.early_stopping_patience,
+                        "criterion_name": model.criterion_name,
+                        "batch_size": model.batch_size,
+                        "optimizer_group": model.optimizer_group,
+                    },
+                }
+            )
+            with metadata_path.open("w", encoding="utf-8") as handle:
+                json.dump(metadata, handle, indent=2)
+
+            return {
+                "serializer": "mlp_state_dict",
+                "path": str(model_path.relative_to(output_dir.parent)),
+                "metadata_path": str(metadata_path.relative_to(output_dir.parent)),
+            }
+
+        model_path = output_dir / f"{base_name}.pkl"
+        with model_path.open("wb") as handle:
+            pickle.dump(model, handle)
+        metadata.update({"serializer": "pickle"})
+        with metadata_path.open("w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2)
+        return {
+            "serializer": "pickle",
+            "path": str(model_path.relative_to(output_dir.parent)),
+            "metadata_path": str(metadata_path.relative_to(output_dir.parent)),
+        }
+
+    @staticmethod
+    def _load_model_artifact(model_path: Path, serializer: str):
+        if serializer == "pickle":
+            with model_path.open("rb") as handle:
+                return pickle.load(handle)
+
+        if serializer == "mlp_state_dict":
+            from protein_embedding_classifier.classifiers.mlp_protein_classifier import MLPProteinClassifier
+            import torch
+
+            metadata_path = model_path.with_suffix(".metadata.json")
+            if not metadata_path.exists():
+                metadata_path = model_path.with_suffix(".meta.json")
+            with metadata_path.open("r", encoding="utf-8") as handle:
+                metadata = json.load(handle)
+            mlp_meta = metadata.get("mlp", metadata)
+
+            net = MLPProteinClassifier(
+                input_size=mlp_meta["input_size"],
+                output_size=mlp_meta["output_size"],
+                num_hidden_layers=mlp_meta["num_hidden_layers"],
+                dropout_rate=mlp_meta["dropout_rate"],
+                hidden_layers_mode=mlp_meta["hidden_layers_mode"],
+                custom_hidden_layers=mlp_meta["custom_hidden_layers"],
+                activation_function=mlp_meta["activation_function"],
+                use_batch_norm=mlp_meta["use_batch_norm"],
+                output_activation=mlp_meta["output_activation"],
+                initialization=mlp_meta["initialization"],
+            )
+            state = torch.load(model_path, map_location="cpu")
+            net.load_state_dict(state)
+            net.eval()
+
+            class _MLPInferenceWrapper:
+                def __init__(self, network, classes):
+                    self.network = network
+                    self.classes_ = np.asarray(classes) if classes is not None else None
+
+                def predict_proba(self, X):
+                    import torch
+
+                    with torch.no_grad():
+                        x_tensor = torch.tensor(X, dtype=torch.float32)
+                        logits = self.network(x_tensor)
+                        if logits.ndim == 1:
+                            logits = logits.unsqueeze(1)
+                        criterion_name = str(mlp_meta.get("criterion_name", "BCEWithLogitsLoss"))
+                        if logits.shape[1] == 1:
+                            positive_prob = torch.sigmoid(logits).cpu().numpy().reshape(-1, 1)
+                            probs = np.hstack([1.0 - positive_prob, positive_prob])
+                            return probs
+                        if criterion_name == "BCEWithLogitsLoss":
+                            probs = torch.sigmoid(logits).cpu().numpy()
+                            return probs
+                        probs = torch.softmax(logits, dim=1).cpu().numpy()
+                        return probs
+
+            return _MLPInferenceWrapper(net, metadata.get("classes"))
+
+        raise ValueError(f"Unsupported model serializer: {serializer}")
+
+    @staticmethod
+    def _get_latest_sweep_run(sweep_root: Path) -> Path | None:
+        candidates = [path for path in sweep_root.iterdir() if path.is_dir()]
+        if not candidates:
+            return None
+        return sorted(candidates, key=lambda path: path.stat().st_mtime, reverse=True)[0]
+
+    @staticmethod
+    def _read_best_classifier_per_embedding_csv(path: Path) -> list[dict[str, Any]]:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            return [dict(row) for row in reader]
+
+    @staticmethod
+    def _write_confusion_matrix_csv(path: Path, matrix: np.ndarray) -> None:
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            for row in np.asarray(matrix):
+                writer.writerow(list(row))
 
     @staticmethod
     def _wandb_init_run(

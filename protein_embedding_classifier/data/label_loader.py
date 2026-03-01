@@ -60,13 +60,20 @@ class LabelLoader:
         if exploded_df.empty:
             return {}
 
-        duplicated = exploded_df[self.accession_column].duplicated(keep=False).any()
         grouped = exploded_df.groupby(self.accession_column)[self.label_column].apply(list)
+        return {acc: self._normalize_grouped_labels(values) for acc, values in grouped.items()}
 
-        if duplicated:
-            return {acc: values for acc, values in grouped.items()}
+    @staticmethod
+    def _normalize_grouped_labels(values: list[Any]) -> Any:
+        deduplicated: list[Any] = []
+        for value in values:
+            if value not in deduplicated:
+                deduplicated.append(value)
 
-        return {acc: values[0] for acc, values in grouped.items()}
+        if len(deduplicated) <= 1:
+            return deduplicated[0]
+
+        return deduplicated
 
     def _load_db_labels(self) -> Dict[str, Any]:
         if self.engine is None:

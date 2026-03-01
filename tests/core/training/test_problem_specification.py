@@ -42,3 +42,17 @@ def test_problem_specification_loss_selection_and_output_size_behavior():
     assert binary.output_size == 2
     assert multiclass.loss_name == "CrossEntropyLoss"
     assert multiclass.output_size == 4
+
+
+def test_problem_specification_singleton_list_labels_are_not_multilabel():
+    labels = np.empty(4, dtype=object)
+    labels[0] = [True]
+    labels[1] = [False]
+    labels[2] = [True]
+    labels[3] = [False]
+
+    spec = ProblemSpecification.from_labels(labels)
+
+    assert spec.problem_type == "binary"
+    assert spec.output_size == 2
+    assert spec.loss_name == "BCEWithLogitsLoss"

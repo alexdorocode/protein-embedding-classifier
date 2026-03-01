@@ -49,7 +49,7 @@ class ModelFactory:
         constructor = self._constructors[normalized_model_type]
 
         if normalized_model_type == "SVM":
-            merged_params.setdefault("probability", True)
+            merged_params["probability"] = True
 
         if normalized_model_type == "MLP":
             merged_params["input_size"] = input_size

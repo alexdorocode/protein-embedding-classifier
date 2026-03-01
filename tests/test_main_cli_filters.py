@@ -10,10 +10,11 @@ def test_main_forwards_runtime_filters(monkeypatch):
         def __init__(self, config_path):
             captured["config_path"] = config_path
 
-        def run(self, step=None, run_all=False, filters=None):
+        def run(self, step=None, run_all=False, filters=None, runtime_context=None):
             captured["step"] = step
             captured["run_all"] = run_all
             captured["filters"] = filters
+            captured["runtime_context"] = runtime_context
 
     monkeypatch.setattr(main_module, "Pipeline", FakePipeline)
     monkeypatch.setattr(main_module, "configure_logging", lambda: None)
@@ -43,3 +44,4 @@ def test_main_forwards_runtime_filters(monkeypatch):
         "classifier": "LR",
         "embedding_group": "sentence",
     }
+    assert "argv" in captured["runtime_context"]

@@ -8,6 +8,7 @@ embedding_groups:
   sentence:
     - ESM2
     - ProtT5
+    - Ankh3-Large
   graph:
     - GeOKG
 
@@ -20,3 +21,13 @@ final_training:
   evaluate_test: true
   save_model: true
   output_dir: artifacts/final_models
+
+reporting:
+  output_root: ../../pec_data
+  run_prefix: sweep
+  dataset_name: default_dataset
+  prediction_split: test
+  thresholds:
+    default: 0.5
+    classifier: {}
+    classifier_embedding: {}
