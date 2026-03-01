@@ -11,6 +11,7 @@ PIPELINE_STEPS = [
     "train",
     "sweep",
     "ensemble",
+    "benchmark",
     "evaluate",
 ]
 
@@ -48,7 +49,7 @@ def main() -> None:
     elif args.sweep:
         selected_step = "sweep"
 
-    if args.evaluate_last_sweep:
+    if args.evaluate_last_sweep and selected_step is None and not run_all:
         selected_step = "evaluate"
 
     if selected_step == "all":

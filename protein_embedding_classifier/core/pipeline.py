@@ -4,8 +4,10 @@ import csv
 import json
 import logging
 import pickle
+import hashlib
+import copy
 from pathlib import Path
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, Callable
 from datetime import datetime
 import numpy as np
@@ -15,10 +17,22 @@ import time
 from importlib import metadata as importlib_metadata
 
 import yaml
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, f1_score
+from sklearn.preprocessing import MultiLabelBinarizer
 
 from protein_embedding_classifier.core.decision.decision_policy import decide
 from protein_embedding_classifier.core.db import create_engine_from_config, load_db_config
+from protein_embedding_classifier.core.ensemble.soft_voting_service import (
+    EnsembleConfig,
+    EnsembleMode,
+    EnsembleSelectionConfig,
+    ModelArtifact,
+    SimpleMajorityVotingService,
+    SoftVotingContractError,
+    SoftVotingService,
+    WeightingConfig,
+    WeightingStrategyType,
+)
 from protein_embedding_classifier.core.embedding_loading import EmbeddingBundle, EmbeddingService
 from protein_embedding_classifier.core.probability.probability_adapter import ProbabilityAdapter
 from protein_embedding_classifier.core.training.problem_specification import ProblemSpecification
@@ -34,7 +48,131 @@ from protein_embedding_classifier.data.splits.zero_shot_organism import ZeroShot
 from protein_embedding_classifier.data.splits.zero_shot_random import ZeroShotRandomSplit
 
 
-PIPELINE_STEPS = ["dataset", "embeddings", "train", "sweep", "ensemble", "evaluate"]
+PIPELINE_STEPS = ["dataset", "embeddings", "train", "sweep", "ensemble", "benchmark", "evaluate"]
+
+
+class _EmbeddingViewPredictor:
+    def __init__(self, model: Any, embedding_name: str):
+        self.model = model
+        self.embedding_name = embedding_name
+
+    def predict_proba(self, X: Any):
+        if isinstance(X, Mapping):
+            if self.embedding_name not in X:
+                raise KeyError(
+                    f"Missing embedding view '{self.embedding_name}' in ensemble inference payload"
+                )
+            return self.model.predict_proba(np.asarray(X[self.embedding_name]))
+        return self.model.predict_proba(X)
+
+
+class _ValidationWeightTrainer:
+    def __init__(self, random_seed: int = 42, n_trials: int = 256):
+        self.random_seed = int(random_seed)
+        self.n_trials = int(max(32, n_trials))
+
+    def fit(
+        self,
+        validation_probabilities: np.ndarray,
+        validation_labels: np.ndarray,
+        model_identifiers: list[str],
+        problem_type: str,
+        classes: list[Any],
+        metric: str | None,
+        params: Mapping[str, Any],
+    ) -> np.ndarray:
+        del model_identifiers
+        del metric
+
+        probs = np.asarray(validation_probabilities)
+        y_true = np.asarray(validation_labels)
+        n_models = probs.shape[0]
+        if n_models < 2:
+            raise ValueError("Weight trainer requires at least two models")
+
+        trials = int(params.get("n_trials", self.n_trials)) if isinstance(params, Mapping) else self.n_trials
+        trials = int(max(32, trials))
+        l2_regularization = (
+            float(params.get("l2_regularization", 0.0)) if isinstance(params, Mapping) else 0.0
+        )
+        l2_regularization = max(0.0, l2_regularization)
+        rng = np.random.default_rng(self.random_seed)
+
+        best_weights = np.ones(n_models, dtype=np.float64) / float(n_models)
+        best_score = float("-inf")
+
+        for _ in range(trials):
+            candidate = rng.dirichlet(np.ones(n_models, dtype=np.float64))
+            blended = np.tensordot(candidate, probs, axes=(0, 0))
+            preds = decide(
+                probs=blended,
+                problem_type=problem_type,
+                threshold_config={"default": 0.5},
+            )
+            score = float(
+                _benchmark_f1_score(
+                    problem_type=problem_type,
+                    y_true=y_true,
+                    y_pred=np.asarray(preds),
+                    classes=classes,
+                )
+            )
+            if l2_regularization > 0.0:
+                score -= float(l2_regularization * np.sum(np.square(candidate)))
+            if score > best_score:
+                best_score = score
+                best_weights = candidate
+
+        return best_weights
+
+
+def _to_multilabel_matrix(values: Any, classes: Sequence[Any]) -> np.ndarray:
+    values_array = np.asarray(values, dtype=object)
+    if values_array.ndim == 2 and np.issubdtype(values_array.dtype, np.number):
+        return values_array.astype(int)
+
+    converted: list[list[Any]] = []
+    for item in values_array:
+        if isinstance(item, np.ndarray):
+            converted.append(item.tolist())
+        elif isinstance(item, (list, tuple, set)):
+            converted.append(list(item))
+        elif item is None:
+            converted.append([])
+        else:
+            converted.append([item])
+
+    class_list = list(classes)
+    mlb = MultiLabelBinarizer(classes=class_list if class_list else None)
+    if class_list:
+        mlb.fit([class_list])
+    else:
+        mlb.fit(converted)
+    return mlb.transform(converted)
+
+
+def _benchmark_f1_score(
+    problem_type: str,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    classes: Sequence[Any],
+) -> float:
+    if problem_type == "multilabel":
+        y_true_bin = _to_multilabel_matrix(y_true, classes)
+        pred_array = np.asarray(y_pred)
+        if pred_array.ndim == 2:
+            y_pred_bin = pred_array.astype(int)
+        else:
+            y_pred_bin = _to_multilabel_matrix(pred_array, classes)
+
+        if y_true_bin.shape != y_pred_bin.shape:
+            raise ValueError(
+                "Multilabel benchmark metric shape mismatch: "
+                f"y_true={y_true_bin.shape} y_pred={y_pred_bin.shape}"
+            )
+        return float(f1_score(y_true_bin, y_pred_bin, average="macro", zero_division=0))
+
+    return float(f1_score(np.asarray(y_true), np.asarray(y_pred), average="macro", zero_division=0))
 
 
 class Pipeline:
@@ -475,8 +613,1417 @@ class Pipeline:
         self.logger.info("Saved test predictions CSV artifact: %s", predictions_csv)
 
     def run_ensemble_step(self, conf: dict[str, Any]) -> None:
-        _ = conf
-        self.logger.info("Ensemble step placeholder (not implemented in this refactor).")
+        pipeline_conf = conf if "dataset" in conf else self._load_yaml(self.config_path)
+        dataset_conf = pipeline_conf.get("dataset", pipeline_conf)
+        embeddings_step_conf = pipeline_conf.get("embeddings", {})
+        ensemble_conf = pipeline_conf.get("ensemble", conf if isinstance(conf, Mapping) else {})
+        if not isinstance(ensemble_conf, Mapping):
+            ensemble_conf = {}
+
+        if not bool(ensemble_conf.get("enabled", True)):
+            self.logger.info("Ensemble step skipped because ensemble.enabled=false")
+            return
+
+        embeddings_config_path = embeddings_step_conf.get("config_path", "config/embeddings.yaml")
+        embeddings_conf = self._load_yaml(embeddings_config_path)
+        training_global_conf = self._load_training_config(pipeline_conf)
+        reporting_conf = self._build_reporting_config(training_global_conf)
+        path_layout = self._ensure_pec_data_layout(reporting_conf)
+
+        source_conf = ensemble_conf.get("source", {}) if isinstance(ensemble_conf.get("source", {}), Mapping) else {}
+        configured_run_dir = source_conf.get("run_dir", ensemble_conf.get("run_dir"))
+        if configured_run_dir:
+            latest_run_dir = Path(str(configured_run_dir)).expanduser().resolve()
+        else:
+            latest_run_dir = self._get_latest_sweep_run(path_layout["sweep"])
+
+        if latest_run_dir is None or not latest_run_dir.exists():
+            raise FileNotFoundError("No sweep run directory available for ensemble step")
+
+        best_csv = latest_run_dir / "reports" / "best_classifier_per_embedding.csv"
+        if not best_csv.exists():
+            raise FileNotFoundError(
+                f"best_classifier_per_embedding.csv not found in {latest_run_dir}. "
+                "Ensemble step requires persisted model artifacts from previous sweep/final training."
+            )
+
+        rows = self._read_best_classifier_per_embedding_csv(best_csv)
+        if not rows:
+            raise FileNotFoundError(f"No model rows found in {best_csv}")
+
+        selected_rows, requested_count = self._select_ensemble_rows(
+            rows=rows,
+            ensemble_conf=dict(ensemble_conf),
+            training_global_conf=training_global_conf,
+        )
+
+        if len(selected_rows) < requested_count:
+            self.logger.warning(
+                "Ensemble selection requested=%d available=%d after artifact/config filtering; continuing",
+                requested_count,
+                len(selected_rows),
+            )
+
+        model_artifacts, selected_payloads = self._load_ensemble_model_artifacts(
+            run_dir=latest_run_dir,
+            selected_rows=selected_rows,
+        )
+        if len(model_artifacts) < 2:
+            raise SoftVotingContractError(
+                f"Ensemble step requires at least 2 models after loading artifacts, got {len(model_artifacts)}"
+            )
+
+        dataset_bundle = self._build_dataset_bundle(dataset_conf)
+        embedding_bundle = self._build_embedding_bundle_from_dataset(
+            dataset_bundle=dataset_bundle,
+            dataset_conf=dataset_conf,
+            embeddings_conf=embeddings_conf,
+        )
+
+        service_config, strategy_type, weighting_params = self._build_soft_voting_service_config(
+            ensemble_conf=dict(ensemble_conf),
+            model_artifacts=model_artifacts,
+        )
+        weight_trainer = None
+        if strategy_type == WeightingStrategyType.TRAINABLE_WEIGHTS:
+            weight_trainer = _ValidationWeightTrainer(
+                random_seed=int(weighting_params.get("random_seed", 42)),
+                n_trials=int(weighting_params.get("n_trials", 256)),
+            )
+
+        soft_voting_service = SoftVotingService(
+            model_artifacts=model_artifacts,
+            config=service_config,
+            weight_trainer=weight_trainer,
+        )
+
+        x_val_map = {name: np.asarray(values) for name, values in embedding_bundle.X_val.items()}
+        x_test_map = {name: np.asarray(values) for name, values in embedding_bundle.X_test.items()}
+        y_val = np.asarray(dataset_bundle.y_val)
+
+        val_probabilities = soft_voting_service.collect_validation_probabilities(x_val_map)
+        soft_voting_service.fit_with_validation(x_val_map, y_val)
+        ensemble_output = soft_voting_service.predict(x_test_map)
+
+        weights = np.asarray(ensemble_output["metadata"].get("ensemble", {}).get("weights", []), dtype=np.float64)
+        summary_rows = self._build_ensemble_summary_rows(
+            model_artifacts=model_artifacts,
+            selected_payloads=selected_payloads,
+            validation_probabilities=val_probabilities,
+            y_val=y_val,
+            weights=weights,
+        )
+        self.logger.info("Ensemble summary table (model -> validation_f1 -> weight):\n%s", self._format_ensemble_summary(summary_rows))
+
+        output_dir = latest_run_dir / "models"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self._save_ensemble_artifact(
+            output_dir=output_dir,
+            ensemble_conf=dict(ensemble_conf),
+            ensemble_output=ensemble_output,
+            summary_rows=summary_rows,
+        )
+        self.logger.info(
+            "Ensemble step completed mode=%s models=%d test_samples=%d",
+            ensemble_output["metadata"].get("ensemble", {}).get("mode"),
+            len(model_artifacts),
+            int(np.asarray(ensemble_output["probabilities"]).shape[0]),
+        )
+
+    def run_benchmark_step(self, conf: dict[str, Any]) -> None:
+        pipeline_conf = conf if "dataset" in conf else self._load_yaml(self.config_path)
+        dataset_conf = pipeline_conf.get("dataset", pipeline_conf)
+        embeddings_step_conf = pipeline_conf.get("embeddings", {})
+        benchmark_conf = pipeline_conf.get("benchmark", conf if isinstance(conf, Mapping) else {})
+        if not isinstance(benchmark_conf, Mapping):
+            benchmark_conf = {}
+
+        metric_name = str(benchmark_conf.get("metric", "f1_macro"))
+        include_uniform = bool(benchmark_conf.get("include_uniform", True))
+        include_validation_weighted = bool(benchmark_conf.get("include_validation_weighted", True))
+        include_trainable = bool(benchmark_conf.get("include_trainable", True))
+        include_majority = bool(benchmark_conf.get("include_majority", True))
+        seeds_raw = benchmark_conf.get("seeds", [42])
+        if isinstance(seeds_raw, list) and seeds_raw:
+            seeds = [int(seed) for seed in seeds_raw]
+        else:
+            seeds = [42]
+        aggregate_mode = str(benchmark_conf.get("aggregate", "mean_std"))
+        ablations_conf = benchmark_conf.get("ablations", [])
+        ablation_specs = self._build_benchmark_ablation_specs(ablations_conf)
+
+        embeddings_config_path = embeddings_step_conf.get("config_path", "config/embeddings.yaml")
+        embeddings_conf = self._load_yaml(embeddings_config_path)
+        training_global_conf = self._load_training_config(pipeline_conf)
+        reporting_conf = self._build_reporting_config(training_global_conf)
+        path_layout = self._ensure_pec_data_layout(reporting_conf)
+
+        latest_run_dir = self._get_latest_sweep_run(path_layout["sweep"])
+        if latest_run_dir is None:
+            raise FileNotFoundError("No previous sweep run found for benchmark step")
+
+        best_csv = latest_run_dir / "reports" / "best_classifier_per_embedding.csv"
+        if not best_csv.exists():
+            raise FileNotFoundError(f"best_classifier_per_embedding.csv not found in {latest_run_dir}")
+
+        rows = self._read_best_classifier_per_embedding_csv(best_csv)
+        results_dir = latest_run_dir / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        benchmark_models_dir = latest_run_dir / "models"
+        benchmark_models_dir.mkdir(parents=True, exist_ok=True)
+
+        variant_specs = self._build_benchmark_variant_specs(
+            metric_name=metric_name,
+            include_uniform=include_uniform,
+            include_validation_weighted=include_validation_weighted,
+            include_trainable=include_trainable,
+            include_majority=include_majority,
+            trainable_params=benchmark_conf.get("trainable_params", {}),
+        )
+
+        seed_level_rows: list[dict[str, Any]] = []
+        seed_failures: list[dict[str, Any]] = []
+        weight_records: list[dict[str, Any]] = []
+        artifact_hashes: dict[str, str] = {}
+        default_payload: dict[str, Any] | None = None
+
+        for ablation in ablation_specs:
+            ablation_name = str(ablation.get("name", "default"))
+            selection_conf = {"selection": dict(ablation.get("selection", {}))}
+            selected_rows, requested_count = self._select_ensemble_rows(
+                rows=rows,
+                ensemble_conf=selection_conf,
+                training_global_conf=training_global_conf,
+            )
+            if len(selected_rows) < requested_count:
+                self.logger.warning(
+                    "Benchmark ablation=%s requested=%d available=%d; continuing",
+                    ablation_name,
+                    requested_count,
+                    len(selected_rows),
+                )
+
+            model_artifacts, selected_payloads = self._load_ensemble_model_artifacts(
+                run_dir=latest_run_dir,
+                selected_rows=selected_rows,
+            )
+            if len(model_artifacts) < 2:
+                self.logger.warning(
+                    "Skipping ablation=%s because it has <2 models after filtering (got=%d)",
+                    ablation_name,
+                    len(model_artifacts),
+                )
+                seed_failures.extend(
+                    [
+                        {
+                            "seed": seed,
+                            "ablation": ablation_name,
+                            "error": f"insufficient_models:{len(model_artifacts)}",
+                        }
+                        for seed in seeds
+                    ]
+                )
+                continue
+
+            for payload in selected_payloads:
+                artifact_rel = str(payload.get("artifact_path", ""))
+                model_path = latest_run_dir / artifact_rel
+                if model_path.exists() and artifact_rel not in artifact_hashes:
+                    artifact_hashes[artifact_rel] = self._sha256_file(model_path)
+
+            for seed in seeds:
+                try:
+                    dataset_conf_for_seed = self._with_seeded_dataset_config(dataset_conf, seed)
+                    dataset_bundle = self._build_dataset_bundle(dataset_conf_for_seed)
+                    embedding_bundle = self._build_embedding_bundle_from_dataset(
+                        dataset_bundle=dataset_bundle,
+                        dataset_conf=dataset_conf_for_seed,
+                        embeddings_conf=embeddings_conf,
+                    )
+
+                    x_val_map = {name: np.asarray(values) for name, values in embedding_bundle.X_val.items()}
+                    x_test_map = {name: np.asarray(values) for name, values in embedding_bundle.X_test.items()}
+                    y_val = np.asarray(dataset_bundle.y_val)
+                    y_test = np.asarray(dataset_bundle.y_test)
+
+                    per_model_scores: list[dict[str, Any]] = []
+                    for artifact in model_artifacts:
+                        val_score, test_score, diagnostics = self._evaluate_model_artifact_scores(
+                            artifact=artifact,
+                            x_val_map=x_val_map,
+                            y_val=y_val,
+                            x_test_map=x_test_map,
+                            y_test=y_test,
+                            include_diagnostics=True,
+                        )
+                        per_model_scores.append(
+                            {
+                                "model": f"{artifact.classifier_name}::{artifact.embedding_name}",
+                                "classifier_name": artifact.classifier_name,
+                                "embedding_name": artifact.embedding_name,
+                                "validation_f1": val_score,
+                                "test_f1": test_score,
+                                "diagnostics": diagnostics,
+                            }
+                        )
+
+                    best_single = max(per_model_scores, key=lambda item: float(item["validation_f1"]))
+                    self._log_best_single_diagnostics(best_single, seed=seed, ablation_name=ablation_name)
+
+                    benchmark_results: list[dict[str, Any]] = [
+                        {
+                            "category": "Single",
+                            "variant": "best_single",
+                            "validation_f1": float(best_single["validation_f1"]),
+                            "test_f1": float(best_single["test_f1"]),
+                            "num_models": 1,
+                            "weighting_strategy": "n/a",
+                            "mode": "single",
+                            "models_used": [best_single["model"]],
+                            "weights": None,
+                        }
+                    ]
+
+                    for spec in variant_specs:
+                        try:
+                            spec_for_seed = dict(spec)
+                            spec_for_seed["params"] = {
+                                **dict(spec.get("params", {})),
+                                "random_seed": seed,
+                            }
+                            result_row = self._run_benchmark_ensemble_variant(
+                                spec=spec_for_seed,
+                                model_artifacts=model_artifacts,
+                                x_val_map=x_val_map,
+                                y_val=y_val,
+                                x_test_map=x_test_map,
+                                y_test=y_test,
+                                selected_payloads=selected_payloads,
+                                benchmark_models_dir=benchmark_models_dir,
+                            )
+                            benchmark_results.append(result_row)
+                        except Exception as exc:
+                            self.logger.warning(
+                                "Skipping benchmark variant=%s seed=%d ablation=%s due to error: %s",
+                                spec.get("variant"),
+                                seed,
+                                ablation_name,
+                                exc,
+                            )
+
+                    if len(benchmark_results) < 2:
+                        raise RuntimeError(
+                            f"Benchmark produced no valid ensemble variants for seed={seed} ablation={ablation_name}"
+                        )
+
+                    best_single_test = float(best_single["test_f1"])
+                    for row in benchmark_results:
+                        delta = float(row.get("test_f1", float("nan"))) - best_single_test
+                        gap = float(row.get("validation_f1", float("nan"))) - float(row.get("test_f1", float("nan")))
+                        row.update(
+                            {
+                                "delta_vs_best_single_test": delta,
+                                "generalization_gap": gap,
+                                "seed": seed,
+                                "ablation": ablation_name,
+                            }
+                        )
+                        seed_level_rows.append(dict(row))
+                        self.logger.info(
+                            "Benchmark seed=%d ablation=%s variant=%s val_f1=%.4f test_f1=%.4f gap=%.4f",
+                            seed,
+                            ablation_name,
+                            row.get("variant"),
+                            float(row.get("validation_f1", float("nan"))),
+                            float(row.get("test_f1", float("nan"))),
+                            gap,
+                        )
+
+                    for row in benchmark_results:
+                        if str(row.get("variant")) == "trainable_weights_soft_voting" and row.get("weights"):
+                            weight_records.append(
+                                {
+                                    "seed": seed,
+                                    "ablation": ablation_name,
+                                    "weights": list(row.get("weights") or []),
+                                    "models_used": list(row.get("models_used") or []),
+                                    "validation_f1": float(row.get("validation_f1", float("nan"))),
+                                    "test_f1": float(row.get("test_f1", float("nan"))),
+                                    "model_validation_scores": dict(row.get("model_validation_scores", {})),
+                                }
+                            )
+
+                    if default_payload is None and ablation_name == "default":
+                        comparison_rows = self._comparison_rows_from_seed_results(benchmark_results)
+                        ranking = self._ranking_from_results(benchmark_results)
+                        default_payload = {
+                            "config": {
+                                "metric": metric_name,
+                                "include_majority": include_majority,
+                                "include_trainable": include_trainable,
+                                "include_validation_weighted": include_validation_weighted,
+                                "include_uniform": include_uniform,
+                                "seed": seed,
+                                "ablation": ablation_name,
+                            },
+                            "best_single": benchmark_results[0],
+                            "ensembles": [row for row in benchmark_results if row.get("category") == "Ensemble"],
+                            "ranking_by_test_metric": ranking,
+                            "comparison_table": comparison_rows,
+                            "models_evaluated": per_model_scores,
+                        }
+                except Exception as exc:
+                    self.logger.warning(
+                        "Skipping benchmark seed=%d ablation=%s due to error: %s",
+                        seed,
+                        ablation_name,
+                        exc,
+                    )
+                    seed_failures.append({"seed": seed, "ablation": ablation_name, "error": str(exc)})
+
+        if not seed_level_rows:
+            raise RuntimeError("Benchmark step failed: all seeds/ablations failed")
+
+        aggregated_rows = self._aggregate_benchmark_seed_rows(seed_level_rows)
+        default_aggregated = [row for row in aggregated_rows if row.get("ablation") == "default"]
+        if not default_aggregated:
+            default_aggregated = aggregated_rows
+
+        multiseed_csv = results_dir / "benchmark_multiseed_summary.csv"
+        self._write_benchmark_multiseed_summary_csv(multiseed_csv, default_aggregated)
+
+        multiseed_json = results_dir / "benchmark_multiseed_summary.json"
+        weights_analysis = self._build_benchmark_weights_analysis(weight_records)
+        overfitting_report = self._build_overfitting_report(seed_level_rows)
+        multiseed_payload = {
+            "aggregate_mode": aggregate_mode,
+            "config": {
+                "metric": metric_name,
+                "seeds": seeds,
+                "include_majority": include_majority,
+                "include_trainable": include_trainable,
+                "include_validation_weighted": include_validation_weighted,
+                "include_uniform": include_uniform,
+                "ablations": [dict(item) for item in ablation_specs],
+            },
+            "per_seed_results": seed_level_rows,
+            "aggregated_metrics": aggregated_rows,
+            "failed_runs": seed_failures,
+            "weights_analysis": weights_analysis,
+            "overfitting_report": overfitting_report,
+            "reproducibility": {
+                "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+                "git_commit": self._git_commit(),
+                "seeds": seeds,
+                "artifact_hashes": artifact_hashes,
+                "config_snapshot": {
+                    "pipeline": pipeline_conf,
+                    "benchmark": dict(benchmark_conf),
+                },
+            },
+        }
+        with multiseed_json.open("w", encoding="utf-8") as handle:
+            json.dump(multiseed_payload, handle, indent=2)
+
+        weights_json = results_dir / "benchmark_weights_analysis.json"
+        with weights_json.open("w", encoding="utf-8") as handle:
+            json.dump(weights_analysis, handle, indent=2)
+
+        ablation_csv = results_dir / "benchmark_ablation_summary.csv"
+        self._write_benchmark_ablation_summary_csv(ablation_csv, aggregated_rows)
+
+        benchmark_csv = results_dir / "benchmark_summary.csv"
+        benchmark_json = results_dir / "benchmark_summary.json"
+        summary_rows = self._benchmark_summary_rows_from_aggregated(default_aggregated)
+        self._write_benchmark_summary_csv(benchmark_csv, summary_rows)
+        with benchmark_json.open("w", encoding="utf-8") as handle:
+            json.dump(default_payload or multiseed_payload, handle, indent=2)
+
+        self.logger.info("Benchmark summary table:\n%s", self._format_benchmark_table(summary_rows))
+        self.logger.info("Saved benchmark CSV artifact: %s", benchmark_csv)
+        self.logger.info("Saved benchmark JSON artifact: %s", benchmark_json)
+        self.logger.info("Saved benchmark multiseed CSV artifact: %s", multiseed_csv)
+        self.logger.info("Saved benchmark multiseed JSON artifact: %s", multiseed_json)
+        self.logger.info("Saved benchmark weight analysis artifact: %s", weights_json)
+        self.logger.info("Saved benchmark ablation summary artifact: %s", ablation_csv)
+
+    def _build_soft_voting_service_config(
+        self,
+        ensemble_conf: dict[str, Any],
+        model_artifacts: list[ModelArtifact],
+    ) -> tuple[EnsembleConfig, WeightingStrategyType, dict[str, Any]]:
+        mode_raw = str(ensemble_conf.get("mode", "global_soft"))
+        mode = EnsembleMode(mode_raw)
+
+        weighting_conf = ensemble_conf.get("weighting", {}) if isinstance(ensemble_conf.get("weighting", {}), Mapping) else {}
+        strategy_raw = str(weighting_conf.get("strategy", "uniform")).strip().lower()
+        strategy_aliases = {
+            "uniform": WeightingStrategyType.UNIFORM,
+            "validation_score_based": WeightingStrategyType.VALIDATION_SCORE_BASED,
+            "validation": WeightingStrategyType.VALIDATION_SCORE_BASED,
+            "trainable": WeightingStrategyType.TRAINABLE_WEIGHTS,
+            "trainable_weights": WeightingStrategyType.TRAINABLE_WEIGHTS,
+        }
+        if strategy_raw not in strategy_aliases:
+            raise ValueError(f"Unsupported ensemble weighting strategy: {strategy_raw}")
+        strategy = strategy_aliases[strategy_raw]
+
+        prechecks_conf = ensemble_conf.get("prechecks", {}) if isinstance(ensemble_conf.get("prechecks", {}), Mapping) else {}
+        selected_embeddings = sorted({artifact.embedding_name for artifact in model_artifacts})
+        selected_classifiers = sorted({artifact.classifier_name for artifact in model_artifacts})
+        weighting_params = dict(weighting_conf.get("params", {})) if isinstance(weighting_conf.get("params", {}), Mapping) else {}
+
+        config = EnsembleConfig(
+            enabled=bool(ensemble_conf.get("enabled", True)),
+            mode=mode,
+            selection=EnsembleSelectionConfig(
+                embeddings=selected_embeddings,
+                classifiers=selected_classifiers,
+            ),
+            weighting=WeightingConfig(
+                strategy=strategy,
+                metric=weighting_conf.get("metric"),
+                params=weighting_params,
+            ),
+            enforce_same_normalization=bool(prechecks_conf.get("enforce_same_normalization", False)),
+            min_models=int(prechecks_conf.get("min_models", 2)),
+        )
+        return config, strategy, weighting_params
+
+    @staticmethod
+    def _build_benchmark_ablation_specs(ablations_conf: Any) -> list[dict[str, Any]]:
+        specs: list[dict[str, Any]] = [{"name": "default", "selection": {}}]
+        if not isinstance(ablations_conf, list):
+            return specs
+        for index, item in enumerate(ablations_conf, start=1):
+            if not isinstance(item, Mapping):
+                continue
+            selection = {}
+            if isinstance(item.get("embeddings"), list):
+                selection["embeddings"] = [str(v) for v in item.get("embeddings", [])]
+            if isinstance(item.get("classifiers"), list):
+                selection["classifiers"] = [str(v) for v in item.get("classifiers", [])]
+            if not selection:
+                continue
+            specs.append({"name": f"ablation_{index}", "selection": selection})
+        return specs
+
+    @staticmethod
+    def _build_benchmark_variant_specs(
+        metric_name: str,
+        include_uniform: bool,
+        include_validation_weighted: bool,
+        include_trainable: bool,
+        include_majority: bool,
+        trainable_params: Any,
+    ) -> list[dict[str, Any]]:
+        variant_specs: list[dict[str, Any]] = []
+        if include_uniform:
+            variant_specs.append(
+                {
+                    "variant": "uniform_soft_voting",
+                    "mode": EnsembleMode.GLOBAL_SOFT,
+                    "strategy": WeightingStrategyType.UNIFORM,
+                    "metric": metric_name,
+                    "params": {},
+                }
+            )
+        if include_validation_weighted:
+            variant_specs.append(
+                {
+                    "variant": "validation_weighted_soft_voting",
+                    "mode": EnsembleMode.GLOBAL_SOFT,
+                    "strategy": WeightingStrategyType.VALIDATION_SCORE_BASED,
+                    "metric": metric_name,
+                    "params": {},
+                }
+            )
+        if include_trainable:
+            variant_specs.append(
+                {
+                    "variant": "trainable_weights_soft_voting",
+                    "mode": EnsembleMode.GLOBAL_SOFT,
+                    "strategy": WeightingStrategyType.TRAINABLE_WEIGHTS,
+                    "metric": metric_name,
+                    "params": dict(trainable_params) if isinstance(trainable_params, Mapping) else {},
+                }
+            )
+        if include_majority:
+            variant_specs.extend(
+                [
+                    {
+                        "variant": "majority_global",
+                        "mode": EnsembleMode.MAJORITY_GLOBAL,
+                        "strategy": WeightingStrategyType.UNIFORM,
+                        "metric": metric_name,
+                        "params": {},
+                    },
+                    {
+                        "variant": "majority_by_embedding",
+                        "mode": EnsembleMode.MAJORITY_BY_EMBEDDING,
+                        "strategy": WeightingStrategyType.UNIFORM,
+                        "metric": metric_name,
+                        "params": {},
+                    },
+                    {
+                        "variant": "majority_by_classifier",
+                        "mode": EnsembleMode.MAJORITY_BY_CLASSIFIER,
+                        "strategy": WeightingStrategyType.UNIFORM,
+                        "metric": metric_name,
+                        "params": {},
+                    },
+                ]
+            )
+        return variant_specs
+
+    @staticmethod
+    def _with_seeded_dataset_config(dataset_conf: dict[str, Any], seed: int) -> dict[str, Any]:
+        cloned = copy.deepcopy(dataset_conf)
+        if isinstance(cloned.get("split"), Mapping):
+            cloned["split"]["random_state"] = int(seed)
+        return cloned
+
+    @staticmethod
+    def _comparison_rows_from_seed_results(benchmark_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "Category": row.get("category"),
+                "Variant": row.get("variant"),
+                "Validation F1": float(row.get("validation_f1", float("nan"))),
+                "Test F1": float(row.get("test_f1", float("nan"))),
+                "Delta vs Best Single (Test)": float(row.get("delta_vs_best_single_test", float("nan"))),
+                "Num Models": int(row.get("num_models", 0)),
+                "Weighting Strategy": row.get("weighting_strategy", ""),
+            }
+            for row in benchmark_results
+        ]
+
+    @staticmethod
+    def _ranking_from_results(benchmark_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return sorted(
+            [
+                {
+                    "variant": row.get("variant"),
+                    "category": row.get("category"),
+                    "test_f1": float(row.get("test_f1", float("nan"))),
+                }
+                for row in benchmark_results
+            ],
+            key=lambda item: float(item.get("test_f1", float("nan"))),
+            reverse=True,
+        )
+
+    @staticmethod
+    def _aggregate_benchmark_seed_rows(seed_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for row in seed_rows:
+            key = (str(row.get("ablation", "default")), str(row.get("variant", "")))
+            grouped.setdefault(key, []).append(row)
+
+        aggregated: list[dict[str, Any]] = []
+        for (ablation, variant), rows in grouped.items():
+            val_values = np.asarray([float(row.get("validation_f1", float("nan"))) for row in rows], dtype=float)
+            test_values = np.asarray([float(row.get("test_f1", float("nan"))) for row in rows], dtype=float)
+            delta_values = np.asarray([float(row.get("delta_vs_best_single_test", float("nan"))) for row in rows], dtype=float)
+            gap_values = np.asarray([float(row.get("generalization_gap", float("nan"))) for row in rows], dtype=float)
+            base = rows[0]
+            aggregated.append(
+                {
+                    "ablation": ablation,
+                    "category": base.get("category"),
+                    "variant": variant,
+                    "mean_validation_f1": float(np.nanmean(val_values)),
+                    "std_validation_f1": float(np.nanstd(val_values)),
+                    "mean_test_f1": float(np.nanmean(test_values)),
+                    "std_test_f1": float(np.nanstd(test_values)),
+                    "mean_delta_vs_best": float(np.nanmean(delta_values)),
+                    "std_delta_vs_best": float(np.nanstd(delta_values)),
+                    "mean_generalization_gap": float(np.nanmean(gap_values)),
+                    "num_models": int(base.get("num_models", 0)),
+                    "weighting_strategy": base.get("weighting_strategy", ""),
+                    "successful_runs": len(rows),
+                }
+            )
+        return sorted(aggregated, key=lambda row: (str(row.get("ablation")), str(row.get("variant"))))
+
+    @staticmethod
+    def _benchmark_summary_rows_from_aggregated(aggregated_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "Category": row.get("category"),
+                "Variant": row.get("variant"),
+                "Validation F1": row.get("mean_validation_f1"),
+                "Test F1": row.get("mean_test_f1"),
+                "Delta vs Best Single (Test)": row.get("mean_delta_vs_best"),
+                "Num Models": row.get("num_models"),
+                "Weighting Strategy": row.get("weighting_strategy"),
+            }
+            for row in aggregated_rows
+        ]
+
+    @staticmethod
+    def _write_benchmark_multiseed_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+        fieldnames = [
+            "Category",
+            "Variant",
+            "Mean Val F1",
+            "Std Val F1",
+            "Mean Test F1",
+            "Std Test F1",
+            "Mean Delta vs Best",
+            "Std Delta vs Best",
+            "Num Models",
+            "Weighting Strategy",
+        ]
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(
+                    {
+                        "Category": row.get("category"),
+                        "Variant": row.get("variant"),
+                        "Mean Val F1": row.get("mean_validation_f1"),
+                        "Std Val F1": row.get("std_validation_f1"),
+                        "Mean Test F1": row.get("mean_test_f1"),
+                        "Std Test F1": row.get("std_test_f1"),
+                        "Mean Delta vs Best": row.get("mean_delta_vs_best"),
+                        "Std Delta vs Best": row.get("std_delta_vs_best"),
+                        "Num Models": row.get("num_models"),
+                        "Weighting Strategy": row.get("weighting_strategy"),
+                    }
+                )
+
+    @staticmethod
+    def _write_benchmark_ablation_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+        fieldnames = [
+            "Ablation",
+            "Category",
+            "Variant",
+            "Mean Val F1",
+            "Std Val F1",
+            "Mean Test F1",
+            "Std Test F1",
+            "Mean Delta vs Best",
+            "Std Delta vs Best",
+            "Num Models",
+            "Weighting Strategy",
+            "Successful Runs",
+        ]
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(
+                    {
+                        "Ablation": row.get("ablation"),
+                        "Category": row.get("category"),
+                        "Variant": row.get("variant"),
+                        "Mean Val F1": row.get("mean_validation_f1"),
+                        "Std Val F1": row.get("std_validation_f1"),
+                        "Mean Test F1": row.get("mean_test_f1"),
+                        "Std Test F1": row.get("std_test_f1"),
+                        "Mean Delta vs Best": row.get("mean_delta_vs_best"),
+                        "Std Delta vs Best": row.get("std_delta_vs_best"),
+                        "Num Models": row.get("num_models"),
+                        "Weighting Strategy": row.get("weighting_strategy"),
+                        "Successful Runs": row.get("successful_runs"),
+                    }
+                )
+
+    def _build_benchmark_weights_analysis(self, weight_records: list[dict[str, Any]]) -> dict[str, Any]:
+        if not weight_records:
+            return {"trainable_weights": [], "aggregated": []}
+
+        aggregated: list[dict[str, Any]] = []
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for record in weight_records:
+            grouped.setdefault(str(record.get("ablation", "default")), []).append(record)
+
+        for ablation, records in grouped.items():
+            model_union: list[str] = []
+            for record in records:
+                for model in record.get("models_used", []):
+                    if model not in model_union:
+                        model_union.append(model)
+
+            matrix: list[list[float]] = []
+            val_scores: list[list[float]] = []
+            for record in records:
+                model_to_weight = {
+                    model: float(weight)
+                    for model, weight in zip(record.get("models_used", []), record.get("weights", []))
+                }
+                model_to_score = {
+                    model: float(score)
+                    for model, score in (record.get("model_validation_scores", {}) or {}).items()
+                }
+                matrix.append([model_to_weight.get(model, 0.0) for model in model_union])
+                val_scores.append([model_to_score.get(model, float("nan")) for model in model_union])
+
+            weight_matrix = np.asarray(matrix, dtype=float)
+            score_matrix = np.asarray(val_scores, dtype=float)
+            mean_weight = np.nanmean(weight_matrix, axis=0)
+            std_weight = np.nanstd(weight_matrix, axis=0)
+            entropy_values = []
+            correlations = []
+            for idx in range(weight_matrix.shape[0]):
+                w = np.asarray(weight_matrix[idx], dtype=float)
+                eps = 1e-12
+                entropy = float(-np.sum(w * np.log(w + eps)))
+                entropy_values.append(entropy)
+
+                s = np.asarray(score_matrix[idx], dtype=float)
+                finite = np.isfinite(s)
+                if np.count_nonzero(finite) > 1 and np.std(w[finite]) > 0 and np.std(s[finite]) > 0:
+                    correlations.append(float(np.corrcoef(s[finite], w[finite])[0, 1]))
+
+            aggregated.append(
+                {
+                    "ablation": ablation,
+                    "models": model_union,
+                    "per_seed_weights": [
+                        {
+                            "seed": record.get("seed"),
+                            "weights": record.get("weights"),
+                            "models": record.get("models_used"),
+                            "validation_f1": record.get("validation_f1"),
+                            "test_f1": record.get("test_f1"),
+                        }
+                        for record in records
+                    ],
+                    "mean_weight_per_model": {
+                        model: float(mean_weight[index]) for index, model in enumerate(model_union)
+                    },
+                    "std_weight_per_model": {
+                        model: float(std_weight[index]) for index, model in enumerate(model_union)
+                    },
+                    "mean_entropy": float(np.nanmean(np.asarray(entropy_values, dtype=float))),
+                    "std_entropy": float(np.nanstd(np.asarray(entropy_values, dtype=float))),
+                    "mean_val_weight_correlation": float(np.nanmean(np.asarray(correlations, dtype=float)))
+                    if correlations
+                    else float("nan"),
+                }
+            )
+
+        return {
+            "trainable_weights": weight_records,
+            "aggregated": aggregated,
+        }
+
+    def _build_overfitting_report(self, seed_rows: list[dict[str, Any]]) -> dict[str, Any]:
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for row in seed_rows:
+            key = (str(row.get("ablation", "default")), str(row.get("variant", "")))
+            grouped.setdefault(key, []).append(row)
+
+        summary: list[dict[str, Any]] = []
+        for (ablation, variant), rows in grouped.items():
+            gaps = np.asarray([float(row.get("generalization_gap", float("nan"))) for row in rows], dtype=float)
+            test_values = np.asarray([float(row.get("test_f1", float("nan"))) for row in rows], dtype=float)
+            summary.append(
+                {
+                    "ablation": ablation,
+                    "variant": variant,
+                    "mean_generalization_gap": float(np.nanmean(gaps)),
+                    "std_generalization_gap": float(np.nanstd(gaps)),
+                    "test_f1_variance": float(np.nanvar(test_values)),
+                }
+            )
+
+        for ablation in sorted({row.get("ablation") for row in summary}):
+            uniform_row = next((row for row in summary if row.get("ablation") == ablation and row.get("variant") == "uniform_soft_voting"), None)
+            trainable_row = next((row for row in summary if row.get("ablation") == ablation and row.get("variant") == "trainable_weights_soft_voting"), None)
+            if uniform_row and trainable_row and float(trainable_row.get("test_f1_variance", 0.0)) > float(uniform_row.get("test_f1_variance", 0.0)):
+                self.logger.warning(
+                    "Potential overfitting ablation=%s: trainable ensemble variance %.6f > uniform variance %.6f",
+                    ablation,
+                    float(trainable_row.get("test_f1_variance", 0.0)),
+                    float(uniform_row.get("test_f1_variance", 0.0)),
+                )
+
+        return {"variants": summary}
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        sha = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(8192), b""):
+                sha.update(chunk)
+        return sha.hexdigest()
+
+    def _log_best_single_diagnostics(self, best_single: dict[str, Any], seed: int, ablation_name: str) -> None:
+        diagnostics = best_single.get("diagnostics", {}) if isinstance(best_single.get("diagnostics", {}), Mapping) else {}
+        class_distribution = diagnostics.get("class_distribution", {})
+        macro_f1 = diagnostics.get("macro_f1", float("nan"))
+        micro_f1 = diagnostics.get("micro_f1", float("nan"))
+        n_val = diagnostics.get("n_val", 0)
+        per_class_f1 = diagnostics.get("per_class_f1", {})
+
+        self.logger.info(
+            "Best single diagnostics seed=%d ablation=%s model=%s n_val=%s class_distribution=%s macro_f1=%.4f micro_f1=%.4f",
+            seed,
+            ablation_name,
+            best_single.get("model"),
+            n_val,
+            class_distribution,
+            float(macro_f1),
+            float(micro_f1),
+        )
+        self.logger.info(
+            "Best single per-class F1 seed=%d ablation=%s: %s",
+            seed,
+            ablation_name,
+            per_class_f1,
+        )
+
+        if float(best_single.get("validation_f1", float("nan"))) >= 0.999999:
+            self.logger.warning(
+                "Validation F1 == 1.0 for seed=%d ablation=%s model=%s; possible overfitting",
+                seed,
+                ablation_name,
+                best_single.get("model"),
+            )
+            confusion = diagnostics.get("confusion_matrix")
+            if confusion is not None:
+                self.logger.warning(
+                    "Best single confusion matrix seed=%d ablation=%s model=%s:\n%s",
+                    seed,
+                    ablation_name,
+                    best_single.get("model"),
+                    confusion,
+                )
+
+    def _evaluate_model_artifact_scores(
+        self,
+        artifact: ModelArtifact,
+        x_val_map: Mapping[str, np.ndarray],
+        y_val: np.ndarray,
+        x_test_map: Mapping[str, np.ndarray],
+        y_test: np.ndarray,
+        include_diagnostics: bool = False,
+    ) -> tuple[float, float, dict[str, Any] | None]:
+        probs_val = ProbabilityAdapter.to_canonical(
+            raw_output=np.asarray(artifact.model.predict_proba(x_val_map)),
+            problem_type=artifact.problem_type,
+            classes=artifact.classes,
+            context=f"benchmark/{artifact.classifier_name}/{artifact.embedding_name}/validation",
+        )
+        preds_val = decide(
+            probs=probs_val,
+            problem_type=artifact.problem_type,
+            threshold_config=artifact.threshold_policy,
+        )
+        val_labels = self._coerce_predictions_to_label_space(np.asarray(preds_val), classes=artifact.classes)
+        val_f1 = _benchmark_f1_score(
+            problem_type=artifact.problem_type,
+            y_true=np.asarray(y_val),
+            y_pred=np.asarray(val_labels),
+            classes=artifact.classes,
+        )
+
+        probs_test = ProbabilityAdapter.to_canonical(
+            raw_output=np.asarray(artifact.model.predict_proba(x_test_map)),
+            problem_type=artifact.problem_type,
+            classes=artifact.classes,
+            context=f"benchmark/{artifact.classifier_name}/{artifact.embedding_name}/test",
+        )
+        preds_test = decide(
+            probs=probs_test,
+            problem_type=artifact.problem_type,
+            threshold_config=artifact.threshold_policy,
+        )
+        test_labels = self._coerce_predictions_to_label_space(np.asarray(preds_test), classes=artifact.classes)
+        test_f1 = _benchmark_f1_score(
+            problem_type=artifact.problem_type,
+            y_true=np.asarray(y_test),
+            y_pred=np.asarray(test_labels),
+            classes=artifact.classes,
+        )
+
+        if not include_diagnostics:
+            return val_f1, test_f1, None
+
+        diagnostics: dict[str, Any] = {
+            "n_val": int(np.asarray(y_val).shape[0]),
+            "macro_f1": val_f1,
+            "micro_f1": float("nan"),
+            "per_class_f1": {},
+            "class_distribution": {},
+            "confusion_matrix": None,
+        }
+
+        if artifact.problem_type == "multilabel":
+            y_val_bin = _to_multilabel_matrix(np.asarray(y_val), artifact.classes)
+            y_pred_bin = np.asarray(val_labels)
+            if y_pred_bin.ndim != 2:
+                y_pred_bin = _to_multilabel_matrix(y_pred_bin, artifact.classes)
+
+            diagnostics["micro_f1"] = float(f1_score(y_val_bin, y_pred_bin, average="micro", zero_division=0))
+            per_class = f1_score(y_val_bin, y_pred_bin, average=None, zero_division=0)
+            diagnostics["per_class_f1"] = {
+                str(label): float(per_class[idx])
+                for idx, label in enumerate(artifact.classes)
+                if idx < len(per_class)
+            }
+            diagnostics["class_distribution"] = {
+                str(label): int(y_val_bin[:, idx].sum())
+                for idx, label in enumerate(artifact.classes)
+                if idx < y_val_bin.shape[1]
+            }
+        else:
+            y_val_arr = np.asarray(y_val)
+            pred_arr = np.asarray(val_labels)
+            diagnostics["micro_f1"] = float(f1_score(y_val_arr, pred_arr, average="micro", zero_division=0))
+            labels = np.unique(y_val_arr)
+            per_class = f1_score(y_val_arr, pred_arr, labels=labels, average=None, zero_division=0)
+            diagnostics["per_class_f1"] = {
+                str(label): float(per_class[idx]) for idx, label in enumerate(labels) if idx < len(per_class)
+            }
+            diagnostics["class_distribution"] = {
+                str(label): int(np.sum(y_val_arr == label)) for label in labels
+            }
+            try:
+                diagnostics["confusion_matrix"] = confusion_matrix(y_val_arr, pred_arr, labels=labels).tolist()
+            except Exception:
+                diagnostics["confusion_matrix"] = None
+
+        return val_f1, test_f1, diagnostics
+
+    def _run_benchmark_ensemble_variant(
+        self,
+        spec: dict[str, Any],
+        model_artifacts: list[ModelArtifact],
+        x_val_map: Mapping[str, np.ndarray],
+        y_val: np.ndarray,
+        x_test_map: Mapping[str, np.ndarray],
+        y_test: np.ndarray,
+        selected_payloads: list[dict[str, Any]],
+        benchmark_models_dir: Path,
+    ) -> dict[str, Any]:
+        variant_name = str(spec.get("variant", "ensemble_variant"))
+        mode = EnsembleMode(spec.get("mode", EnsembleMode.GLOBAL_SOFT))
+        strategy = WeightingStrategyType(spec.get("strategy", WeightingStrategyType.UNIFORM))
+
+        ensemble_conf = {
+            "enabled": True,
+            "mode": mode.value,
+            "weighting": {
+                "strategy": strategy.value,
+                "metric": spec.get("metric", "f1_macro"),
+                "params": dict(spec.get("params", {})) if isinstance(spec.get("params", {}), Mapping) else {},
+            },
+        }
+        service_config, strategy_type, weighting_params = self._build_soft_voting_service_config(
+            ensemble_conf=ensemble_conf,
+            model_artifacts=model_artifacts,
+        )
+
+        weight_trainer = None
+        if strategy_type == WeightingStrategyType.TRAINABLE_WEIGHTS:
+            weight_trainer = _ValidationWeightTrainer(
+                random_seed=int(weighting_params.get("random_seed", 42)),
+                n_trials=int(weighting_params.get("n_trials", 256)),
+            )
+
+        majority_service = SimpleMajorityVotingService() if mode != EnsembleMode.GLOBAL_SOFT else None
+        service = SoftVotingService(
+            model_artifacts=model_artifacts,
+            config=service_config,
+            weight_trainer=weight_trainer,
+            majority_voting_service=majority_service,
+        )
+
+        val_probabilities = service.collect_validation_probabilities(x_val_map)
+        service.fit_with_validation(x_val_map, np.asarray(y_val))
+        val_output = service.predict(x_val_map)
+        test_output = service.predict(x_test_map)
+
+        val_labels = self._coerce_predictions_to_label_space(
+            np.asarray(val_output.get("labels")),
+            classes=np.asarray(test_output.get("metadata", {}).get("classes", []), dtype=object).tolist(),
+        )
+        test_labels = self._coerce_predictions_to_label_space(
+            np.asarray(test_output.get("labels")),
+            classes=np.asarray(test_output.get("metadata", {}).get("classes", []), dtype=object).tolist(),
+        )
+        ensemble_problem_type = str(test_output.get("metadata", {}).get("problem_type", "binary"))
+        ensemble_classes = np.asarray(test_output.get("metadata", {}).get("classes", []), dtype=object).tolist()
+
+        val_f1 = _benchmark_f1_score(
+            problem_type=ensemble_problem_type,
+            y_true=np.asarray(y_val),
+            y_pred=np.asarray(val_labels),
+            classes=ensemble_classes,
+        )
+        test_f1 = _benchmark_f1_score(
+            problem_type=ensemble_problem_type,
+            y_true=np.asarray(y_test),
+            y_pred=np.asarray(test_labels),
+            classes=ensemble_classes,
+        )
+        weights = np.asarray(test_output.get("metadata", {}).get("ensemble", {}).get("weights", []), dtype=np.float64)
+
+        summary_rows = self._build_ensemble_summary_rows(
+            model_artifacts=model_artifacts,
+            selected_payloads=selected_payloads,
+            validation_probabilities=val_probabilities,
+            y_val=np.asarray(y_val),
+            weights=weights,
+        )
+
+        if strategy_type == WeightingStrategyType.TRAINABLE_WEIGHTS:
+            self._save_ensemble_artifact(
+                output_dir=benchmark_models_dir,
+                ensemble_conf=ensemble_conf,
+                ensemble_output=test_output,
+                summary_rows=summary_rows,
+                artifact_name=f"benchmark_{variant_name}",
+            )
+
+        return {
+            "category": "Ensemble",
+            "variant": variant_name,
+            "validation_f1": val_f1,
+            "test_f1": test_f1,
+            "num_models": len(model_artifacts),
+            "weighting_strategy": strategy.value,
+            "mode": mode.value,
+            "models_used": [f"{artifact.classifier_name}::{artifact.embedding_name}" for artifact in model_artifacts],
+            "weights": weights.tolist() if weights.size else [],
+            "model_validation_scores": {
+                str(row.get("model")): float(row.get("validation_score", float("nan"))) for row in summary_rows
+            },
+        }
+
+    @staticmethod
+    def _coerce_predictions_to_label_space(predictions: np.ndarray, classes: list[Any]) -> np.ndarray:
+        preds = np.asarray(predictions)
+        class_array = np.asarray(classes)
+        if preds.ndim == 1 and class_array.size > 0 and np.issubdtype(preds.dtype, np.integer):
+            if preds.size == 0:
+                return preds
+            min_index = int(np.min(preds))
+            max_index = int(np.max(preds))
+            if min_index >= 0 and max_index < class_array.size:
+                return class_array[preds]
+        return preds
+
+    @staticmethod
+    def _write_benchmark_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        fieldnames = [
+            "Category",
+            "Variant",
+            "Validation F1",
+            "Test F1",
+            "Delta vs Best Single (Test)",
+            "Num Models",
+            "Weighting Strategy",
+        ]
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    @staticmethod
+    def _format_benchmark_table(rows: list[dict[str, Any]]) -> str:
+        if not rows:
+            return "(empty)"
+
+        category_w = max(len("Category"), *(len(str(row.get("Category", ""))) for row in rows))
+        variant_w = max(len("Variant"), *(len(str(row.get("Variant", ""))) for row in rows))
+        val_w = len("Validation F1")
+        test_w = len("Test F1")
+        delta_w = len("Delta")
+        num_w = len("Num")
+        weight_w = max(len("Weighting Strategy"), *(len(str(row.get("Weighting Strategy", ""))) for row in rows))
+
+        lines = [
+            f"{'Category':<{category_w}}  {'Variant':<{variant_w}}  {'Validation F1':>{val_w}}  {'Test F1':>{test_w}}  {'Delta':>{delta_w}}  {'Num':>{num_w}}  {'Weighting Strategy':<{weight_w}}",
+            f"{'-' * category_w}  {'-' * variant_w}  {'-' * val_w}  {'-' * test_w}  {'-' * delta_w}  {'-' * num_w}  {'-' * weight_w}",
+        ]
+        for row in rows:
+            lines.append(
+                f"{str(row.get('Category', '')):<{category_w}}  "
+                f"{str(row.get('Variant', '')):<{variant_w}}  "
+                f"{float(row.get('Validation F1', float('nan'))):>{val_w}.4f}  "
+                f"{float(row.get('Test F1', float('nan'))):>{test_w}.4f}  "
+                f"{float(row.get('Delta vs Best Single (Test)', float('nan'))):>{delta_w}.4f}  "
+                f"{int(row.get('Num Models', 0)):>{num_w}d}  "
+                f"{str(row.get('Weighting Strategy', '')):<{weight_w}}"
+            )
+        return "\n".join(lines)
+
+    def _select_ensemble_rows(
+        self,
+        rows: list[dict[str, Any]],
+        ensemble_conf: dict[str, Any],
+        training_global_conf: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], int]:
+        selection = ensemble_conf.get("selection", {}) if isinstance(ensemble_conf.get("selection", {}), Mapping) else {}
+
+        available_embeddings = sorted({str(row.get("embedding_name", "")) for row in rows if row.get("embedding_name")})
+        available_classifiers = sorted({str(row.get("model_type", "")) for row in rows if row.get("model_type")})
+
+        selected_embeddings = set(
+            self._resolve_selected_embeddings(
+                available=available_embeddings,
+                filters=self.runtime_filters,
+                training_global_conf=training_global_conf,
+            )
+        )
+        selected_classifiers = set(
+            self._resolve_selected_classifiers(
+                available=available_classifiers,
+                filters=self.runtime_filters,
+                training_global_conf=training_global_conf,
+            )
+        )
+
+        conf_embeddings_raw = selection.get("embeddings")
+        if isinstance(conf_embeddings_raw, list) and conf_embeddings_raw:
+            conf_embeddings = {str(item) for item in conf_embeddings_raw}
+            selected_embeddings &= conf_embeddings
+
+        conf_classifiers_raw = selection.get("classifiers")
+        if isinstance(conf_classifiers_raw, list) and conf_classifiers_raw:
+            conf_classifiers = {str(item) for item in conf_classifiers_raw}
+            selected_classifiers &= conf_classifiers
+
+        filtered = [
+            dict(row)
+            for row in rows
+            if str(row.get("embedding_name")) in selected_embeddings
+            and str(row.get("model_type")) in selected_classifiers
+        ]
+
+        if not filtered:
+            raise ValueError("No ensemble candidate models after applying config/runtime selection filters")
+
+        requested = len(filtered)
+        if isinstance(conf_embeddings_raw, list) and conf_embeddings_raw:
+            requested = len(conf_embeddings_raw)
+        if isinstance(conf_classifiers_raw, list) and conf_classifiers_raw:
+            requested = max(requested, len(conf_classifiers_raw))
+
+        top_k_per_embedding = selection.get("top_k_per_embedding")
+        if isinstance(top_k_per_embedding, int) and top_k_per_embedding > 0:
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for row in filtered:
+                grouped.setdefault(str(row.get("embedding_name")), []).append(row)
+            filtered = []
+            for group_rows in grouped.values():
+                ranked = sorted(group_rows, key=lambda row: self._safe_float(row.get("validation_f1")), reverse=True)
+                filtered.extend(ranked[:top_k_per_embedding])
+
+        top_k_per_classifier = selection.get("top_k_per_classifier")
+        if isinstance(top_k_per_classifier, int) and top_k_per_classifier > 0:
+            grouped = {}
+            for row in filtered:
+                grouped.setdefault(str(row.get("model_type")), []).append(row)
+            reduced: list[dict[str, Any]] = []
+            for group_rows in grouped.values():
+                ranked = sorted(group_rows, key=lambda row: self._safe_float(row.get("validation_f1")), reverse=True)
+                reduced.extend(ranked[:top_k_per_classifier])
+            filtered = reduced
+
+        deduped: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str, str, str]] = set()
+        for row in filtered:
+            key = (str(row.get("model_type")), str(row.get("embedding_name")), str(row.get("artifact_path", "")))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append(row)
+
+        return deduped, max(1, requested)
+
+    def _load_ensemble_model_artifacts(
+        self,
+        run_dir: Path,
+        selected_rows: list[dict[str, Any]],
+    ) -> tuple[list[ModelArtifact], list[dict[str, Any]]]:
+        model_artifacts: list[ModelArtifact] = []
+        payloads: list[dict[str, Any]] = []
+
+        for row in selected_rows:
+            classifier = str(row.get("model_type", ""))
+            embedding_name = str(row.get("embedding_name", ""))
+            artifact_rel = str(row.get("artifact_path", ""))
+            serializer = str(row.get("serializer", "pickle"))
+            if not artifact_rel:
+                self.logger.warning(
+                    "Skipping ensemble candidate model_type=%s embedding=%s due to missing artifact_path",
+                    classifier,
+                    embedding_name,
+                )
+                continue
+
+            model_path = run_dir / artifact_rel
+            if not model_path.exists() and artifact_rel.startswith(f"{run_dir.name}/"):
+                model_path = run_dir / artifact_rel.split("/", 1)[1]
+            if not model_path.exists():
+                self.logger.warning(
+                    "Skipping ensemble candidate model_type=%s embedding=%s missing artifact=%s",
+                    classifier,
+                    embedding_name,
+                    model_path,
+                )
+                continue
+
+            metadata_path = str(row.get("metadata_path", ""))
+            resolved_metadata_path = run_dir / metadata_path if metadata_path else model_path.with_suffix(".metadata.json")
+            if not resolved_metadata_path.exists() and metadata_path.startswith(f"{run_dir.name}/"):
+                resolved_metadata_path = run_dir / metadata_path.split("/", 1)[1]
+            if not resolved_metadata_path.exists():
+                self.logger.warning(
+                    "Skipping ensemble candidate model_type=%s embedding=%s missing metadata=%s",
+                    classifier,
+                    embedding_name,
+                    resolved_metadata_path,
+                )
+                continue
+
+            with resolved_metadata_path.open("r", encoding="utf-8") as handle:
+                metadata = json.load(handle) or {}
+            model = self._load_model_artifact(model_path=model_path, serializer=serializer)
+            wrapped_model = _EmbeddingViewPredictor(model=model, embedding_name=embedding_name)
+
+            artifact = ModelArtifact.from_metadata(model=wrapped_model, metadata=metadata)
+            if not artifact.classifier_name:
+                artifact = ModelArtifact(
+                    model=artifact.model,
+                    problem_type=artifact.problem_type,
+                    classes=artifact.classes,
+                    num_classes=artifact.num_classes,
+                    normalization=artifact.normalization,
+                    threshold_policy=artifact.threshold_policy,
+                    classifier_name=classifier,
+                    embedding_name=embedding_name,
+                    metadata=artifact.metadata,
+                )
+
+            model_artifacts.append(artifact)
+            payloads.append(
+                {
+                    "classifier_name": classifier,
+                    "embedding_name": embedding_name,
+                    "artifact_path": str(artifact_rel),
+                    "serializer": serializer,
+                    "metadata_path": str(metadata_path or resolved_metadata_path.relative_to(run_dir)),
+                    "validation_f1": self._safe_float(row.get("validation_f1")),
+                }
+            )
+
+        return model_artifacts, payloads
+
+    def _build_ensemble_summary_rows(
+        self,
+        model_artifacts: list[ModelArtifact],
+        selected_payloads: list[dict[str, Any]],
+        validation_probabilities: np.ndarray,
+        y_val: np.ndarray,
+        weights: np.ndarray,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for index, artifact in enumerate(model_artifacts):
+            probs = np.asarray(validation_probabilities[index])
+            preds = decide(
+                probs=probs,
+                problem_type=artifact.problem_type,
+                threshold_config=artifact.threshold_policy,
+            )
+            if artifact.problem_type != "multilabel":
+                preds_array = np.asarray(preds)
+                class_array = np.asarray(artifact.classes)
+                if preds_array.ndim == 1 and np.issubdtype(preds_array.dtype, np.integer):
+                    if preds_array.size == 0 or (
+                        int(np.min(preds_array)) >= 0 and int(np.max(preds_array)) < len(class_array)
+                    ):
+                        preds = class_array[preds_array]
+
+            val_score = _benchmark_f1_score(
+                problem_type=artifact.problem_type,
+                y_true=np.asarray(y_val),
+                y_pred=np.asarray(preds),
+                classes=artifact.classes,
+            )
+            payload = selected_payloads[index]
+            rows.append(
+                {
+                    "model": f"{artifact.classifier_name}::{artifact.embedding_name}",
+                    "classifier_name": artifact.classifier_name,
+                    "embedding_name": artifact.embedding_name,
+                    "validation_score": val_score,
+                    "weight": float(weights[index]) if index < len(weights) else float("nan"),
+                    "artifact_path": payload.get("artifact_path"),
+                    "serializer": payload.get("serializer"),
+                    "metadata_path": payload.get("metadata_path"),
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _format_ensemble_summary(rows: list[dict[str, Any]]) -> str:
+        headers = ("model", "validation_f1", "weight")
+        model_width = max(len(headers[0]), *(len(str(row.get("model", ""))) for row in rows))
+        score_width = len(headers[1])
+        weight_width = len(headers[2])
+
+        output = [
+            f"{headers[0]:<{model_width}}  {headers[1]:>{score_width}}  {headers[2]:>{weight_width}}",
+            f"{'-' * model_width}  {'-' * score_width}  {'-' * weight_width}",
+        ]
+        for row in rows:
+            output.append(
+                f"{str(row.get('model', '')):<{model_width}}  "
+                f"{float(row.get('validation_score', float('nan'))):>{score_width}.4f}  "
+                f"{float(row.get('weight', float('nan'))):>{weight_width}.4f}"
+            )
+        return "\n".join(output)
+
+    def _save_ensemble_artifact(
+        self,
+        output_dir: Path,
+        ensemble_conf: dict[str, Any],
+        ensemble_output: dict[str, Any],
+        summary_rows: list[dict[str, Any]],
+        artifact_name: str = "ensemble_model",
+    ) -> None:
+        ensemble_pkl = output_dir / f"{artifact_name}.pkl"
+        metadata_path = output_dir / f"{artifact_name}.metadata.json"
+
+        metadata = dict(ensemble_output.get("metadata", {}))
+        ensemble_meta = metadata.get("ensemble", {}) if isinstance(metadata.get("ensemble", {}), Mapping) else {}
+
+        persistence_payload = {
+            "ensemble_config": dict(ensemble_conf),
+            "weights": list(ensemble_meta.get("weights", [])),
+            "models_used": summary_rows,
+            "problem_type": metadata.get("problem_type"),
+            "classes": metadata.get("classes"),
+            "num_classes": metadata.get("num_classes"),
+            "threshold_policy": metadata.get("threshold_policy", {}),
+            "weighting_strategy": ensemble_meta.get("weighting", {}),
+            "mode": ensemble_meta.get("mode"),
+        }
+
+        with ensemble_pkl.open("wb") as handle:
+            pickle.dump(persistence_payload, handle)
+        with metadata_path.open("w", encoding="utf-8") as handle:
+            json.dump(persistence_payload, handle, indent=2)
+
+        self.logger.info("Saved ensemble artifact: %s", ensemble_pkl)
+        self.logger.info("Saved ensemble metadata: %s", metadata_path)
+
+    @staticmethod
+    def _safe_float(value: Any) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float("nan")
 
     def run_evaluate_step(self, conf: dict[str, Any]) -> None:
         _ = conf
@@ -627,6 +2174,7 @@ class Pipeline:
             "train": self.run_train_step,
             "sweep": self.run_sweep_step,
             "ensemble": self.run_ensemble_step,
+            "benchmark": self.run_benchmark_step,
             "evaluate": self.run_evaluate_step,
         }
 
