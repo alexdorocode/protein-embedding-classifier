@@ -173,6 +173,8 @@ dataset:
 #
 # Example:
 # train:
+#   feature_processing:
+#     normalize: none  # options: none | l2 | standard
 #   classifier: logistic_regression
 #   max_iter: 1000
 ################################################################################

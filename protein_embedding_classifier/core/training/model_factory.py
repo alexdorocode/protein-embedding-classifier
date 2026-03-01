@@ -62,6 +62,9 @@ class ModelFactory:
     def _preprocess_params(model_type: str, params: dict[str, Any]) -> dict[str, Any]:
         merged = dict(params)
 
+        if model_type == "LR" and merged.get("penalty") == "l2":
+            merged.pop("penalty", None)
+
         if model_type == "SVM" and isinstance(merged.get("kernel_config"), dict):
             kernel_config = merged.pop("kernel_config")
             merged.update(kernel_config)

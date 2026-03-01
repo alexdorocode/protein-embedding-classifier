@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import csv
 import logging
 import pickle
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any, Callable
 
 import yaml
@@ -239,6 +241,8 @@ class Pipeline:
         num_trials = int(sweep_conf.get("num_trials", 1))
         wandb_project = str(sweep_conf.get("wandb_project", "protein-embedding-classifier"))
         classifier_sweeps = self._resolve_classifier_sweeps(sweep_conf)
+        artifacts_dir = Path(str(sweep_conf.get("artifacts_dir", "artifacts")))
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
 
         if model_type is None or model_type.lower() == "all":
             selected_classifier_sweeps = classifier_sweeps
@@ -257,6 +261,7 @@ class Pipeline:
 
         best_results: dict[str, dict[str, Any]] = {}
         global_best: dict[str, Any] | None = None
+        all_trial_results: list[dict[str, Any]] = []
 
         for current_model_type, sweep_config_path in selected_classifier_sweeps.items():
             self.logger.info(
@@ -274,6 +279,7 @@ class Pipeline:
                     num_trials=num_trials,
                     training_config=dict(train_conf),
                     wandb_project=wandb_project,
+                    artifacts_dir=str(artifacts_dir),
                 )
             except ImportError as exc:
                 self.logger.warning(
@@ -306,6 +312,7 @@ class Pipeline:
                     "best_config": result.best_config,
                     "sweep_config_path": sweep_config_path,
                 }
+            all_trial_results.extend(result.trial_results)
             self.logger.info(
                 "Finished classifier sweep model_type=%s best_embedding=%s validation_f1=%.6f",
                 current_model_type,
@@ -316,13 +323,18 @@ class Pipeline:
         if not best_results:
             raise RuntimeError("Sweep did not produce results for any classifier")
 
-        artifacts_dir = Path(str(sweep_conf.get("artifacts_dir", "artifacts")))
-        artifacts_dir.mkdir(parents=True, exist_ok=True)
-
         per_classifier_path = artifacts_dir / "best_config_by_classifier.yaml"
         with per_classifier_path.open("w", encoding="utf-8") as handle:
             yaml.safe_dump(best_results, handle, sort_keys=False)
         self.logger.info("Saved per-classifier sweep results artifact: %s", per_classifier_path)
+
+        full_results_csv = artifacts_dir / "sweep_results_full.csv"
+        self._write_full_sweep_results_csv(full_results_csv, all_trial_results)
+        self.logger.info("Saved full sweep results CSV artifact: %s", full_results_csv)
+
+        best_per_classifier_csv = artifacts_dir / "best_per_classifier.csv"
+        self._write_best_per_classifier_csv(best_per_classifier_csv, best_results)
+        self.logger.info("Saved per-classifier sweep CSV artifact: %s", best_per_classifier_csv)
 
         best_config_path = artifacts_dir / "best_config.yaml"
         with best_config_path.open("w", encoding="utf-8") as handle:
@@ -330,12 +342,22 @@ class Pipeline:
 
         self.logger.info("Saved sweep best config artifact: %s", best_config_path)
         if global_best is not None:
+            global_best_csv = artifacts_dir / "global_best.csv"
+            self._write_global_best_csv(global_best_csv, global_best)
+            self.logger.info("Saved global best CSV artifact: %s", global_best_csv)
+
             self.logger.info(
                 "Sweep global best result model_type=%s embedding_name=%s validation_f1=%.6f",
                 global_best["model_type"],
                 global_best["embedding_name"],
                 float(global_best["best_metric"]),
             )
+
+        summary_table = SweepService.build_summary_table(
+            trial_results=all_trial_results,
+            model_order=sorted(selected_classifier_sweeps.keys()),
+        )
+        self.logger.info("Validation summary table (F1):\n%s", summary_table)
 
     def run_ensemble_step(self, conf: dict[str, Any]) -> None:
         _ = conf
@@ -415,3 +437,84 @@ class Pipeline:
             resolved[legacy_model_type] = legacy_config_path
 
         return resolved
+
+    @staticmethod
+    def _write_best_per_classifier_csv(path: Path, best_results: dict[str, dict[str, Any]]) -> None:
+        rows: list[dict[str, Any]] = []
+        for model_type, payload in sorted(best_results.items()):
+            best_key = payload.get("best_key", (None, None))
+            best_embedding = best_key[1] if isinstance(best_key, tuple) and len(best_key) > 1 else None
+            rows.append(
+                {
+                    "model_type": model_type,
+                    "best_embedding": best_embedding,
+                    "best_metric": payload.get("best_metric"),
+                    "sweep_config_path": payload.get("sweep_config_path"),
+                    "best_config": yaml.safe_dump(payload.get("best_config", {}), sort_keys=True).strip(),
+                }
+            )
+
+        fieldnames = ["model_type", "best_embedding", "best_metric", "sweep_config_path", "best_config"]
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    @staticmethod
+    def _write_global_best_csv(path: Path, global_best: dict[str, Any]) -> None:
+        row = {
+            "model_type": global_best.get("model_type"),
+            "embedding_name": global_best.get("embedding_name"),
+            "best_metric": global_best.get("best_metric"),
+            "sweep_config_path": global_best.get("sweep_config_path"),
+            "best_config": yaml.safe_dump(global_best.get("best_config", {}), sort_keys=True).strip(),
+        }
+
+        fieldnames = ["model_type", "embedding_name", "best_metric", "sweep_config_path", "best_config"]
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerow(row)
+
+    @staticmethod
+    def _write_full_sweep_results_csv(path: Path, trial_results: list[dict[str, Any]]) -> None:
+        rows: list[dict[str, Any]] = []
+
+        def _flatten(data: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
+            flattened: dict[str, Any] = {}
+            for key, value in data.items():
+                normalized_key = f"{prefix}{key}"
+                if isinstance(value, Mapping):
+                    flattened.update(_flatten(value, prefix=f"{normalized_key}."))
+                else:
+                    flattened[normalized_key] = value
+            return flattened
+
+        for result in trial_results:
+            config_values = _flatten(result.get("config", {}))
+            validation_metrics = result.get("validation_metrics", {})
+            test_metrics = result.get("test_metrics", {})
+            rows.append(
+                {
+                    "model_type": result.get("model_type"),
+                    "embedding_name": result.get("embedding_name"),
+                    "trial_index": result.get("trial_index"),
+                    "selection_metric_name": result.get("selection_metric_name"),
+                    "selection_metric_value": result.get("selection_metric_value"),
+                    **{f"config.{key}": value for key, value in config_values.items()},
+                    **{f"val_{key}": value for key, value in validation_metrics.items()},
+                    **{f"test_{key}": value for key, value in test_metrics.items()},
+                }
+            )
+
+        if not rows:
+            with path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["model_type", "embedding_name", "trial_index"])
+                writer.writeheader()
+            return
+
+        fieldnames = sorted({key for row in rows for key in row.keys()})
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)

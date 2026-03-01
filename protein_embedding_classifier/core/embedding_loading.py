@@ -171,11 +171,19 @@ class LayerAggregationStrategy:
         return [layer_map[layer_index] for layer_index in ordered_indices]
 
 
+import logging
+from pathlib import Path
+from typing import Any, Dict
+
+import numpy as np
+import pandas as pd
+
+
 class GOEmbeddingLoader:
     def __init__(self):
         self.logger = logging.getLogger(self.__class__.__name__)
 
-    def load(self, config: dict[str, Any], accessions: list[str]) -> AggregatedEmbeddings:
+    def load(self, config: dict[str, Any], accessions: list[str]) -> Dict[str, Dict[str, np.ndarray]]:
         go_conf = config.get("GOPE", {})
         if not go_conf.get("enabled", False):
             self.logger.info("GOPE disabled; skipping GO embedding load")
@@ -192,27 +200,74 @@ class GOEmbeddingLoader:
         embedding_column = file_info.get("embedding_column", "embedding")
 
         file_names = self._resolve_go_file_names(file_info)
+
         accession_set = set(accessions)
-        model_embeddings: dict[str, np.ndarray] = {}
+
+        # Store embeddings per ontology
+        ontology_embeddings: dict[str, dict[str, np.ndarray]] = {}
+        ontology_dims: dict[str, int] = {}
 
         for file_name in file_names:
             file_path = folder / file_name
             df = pd.read_csv(file_path)
+
             if accession_column not in df.columns or embedding_column not in df.columns:
                 raise ValueError(
                     f"GO file {file_path} missing required columns "
                     f"{accession_column}/{embedding_column}"
                 )
 
+            # Infer ontology name from filename
+            ontology_name = self._infer_ontology_name(file_name)
+
             filtered_df = df[df[accession_column].isin(accession_set)]
+
+            emb_dict: dict[str, np.ndarray] = {}
+
             for record in filtered_df[[accession_column, embedding_column]].to_dict("records"):
                 accession = str(record[accession_column])
                 vector = coerce_embedding_vector(record[embedding_column])
-                model_embeddings[str(accession)] = vector
+                emb_dict[accession] = vector
 
-            self.logger.info("Loaded GO embeddings from %s matched=%d", file_path, len(filtered_df))
+            if emb_dict:
+                ontology_dims[ontology_name] = len(next(iter(emb_dict.values())))
+            else:
+                ontology_dims[ontology_name] = 0
 
-        return {"GeOKG": model_embeddings}
+            ontology_embeddings[ontology_name] = emb_dict
+
+            self.logger.info(
+                "Loaded GO embeddings from %s (ontology=%s) matched=%d",
+                file_path,
+                ontology_name,
+                len(filtered_df),
+            )
+
+        # Concatenate BP + MF + CC
+        concatenated_embeddings: dict[str, np.ndarray] = {}
+
+        for acc in accessions:
+            vectors = []
+
+            for ontology_name in sorted(ontology_embeddings.keys()):
+                emb_dict = ontology_embeddings[ontology_name]
+                dim = ontology_dims[ontology_name]
+
+                if acc in emb_dict:
+                    vectors.append(emb_dict[acc])
+                else:
+                    # pad missing ontology with zeros
+                    vectors.append(np.zeros(dim, dtype=np.float32))
+
+            if vectors:
+                concatenated_embeddings[acc] = np.concatenate(vectors)
+
+        final_dim = sum(ontology_dims.values())
+        self.logger.info(
+            "Concatenated GO embeddings: total_dim=%d ontologies=%s",
+            final_dim,
+            list(ontology_embeddings.keys()),
+        )
 
     @staticmethod
     def _resolve_go_file_names(file_info: dict[str, Any]) -> list[str]:
@@ -224,6 +279,16 @@ class GOEmbeddingLoader:
             if key.startswith("file_name") and isinstance(value, str)
         ]
 
+    @staticmethod
+    def _infer_ontology_name(file_name: str) -> str:
+        file_name = file_name.lower()
+        if "_p_" in file_name or "bp" in file_name:
+            return "BP"
+        if "_f_" in file_name or "mf" in file_name:
+            return "MF"
+        if "_c_" in file_name or "cc" in file_name:
+            return "CC"
+        return file_name
 
 class EmbeddingService:
     def __init__(self, embeddings_config: dict[str, Any], engine: Engine, accessions: list[str]):

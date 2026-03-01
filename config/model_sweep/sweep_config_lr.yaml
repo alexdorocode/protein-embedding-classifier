@@ -4,8 +4,6 @@ metric:
   goal: maximize
 
 parameters:
-  penalty:
-    values: ['l2']
   solver:
     values: ['liblinear', 'lbfgs']
 

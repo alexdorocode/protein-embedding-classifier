@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 from sklearn.metrics import f1_score
 from sklearn.multiclass import OneVsRestClassifier
-from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.preprocessing import MultiLabelBinarizer, StandardScaler, normalize
 
 from protein_embedding_classifier.core.embedding_loading import EmbeddingBundle
 from protein_embedding_classifier.core.training.model_factory import ModelFactory
@@ -35,12 +35,24 @@ class TrainingService:
         model_types = config.get("model_types", ["LR"])
         model_params = config.get("model_params", {})
         metrics_average = config.get("metrics_average", "macro")
+        normalization_mode = self._resolve_normalization_mode(config)
+
+        self.logger.info("Normalization mode: %s", normalization_mode)
 
         results: dict[tuple[str, str], dict[str, Any]] = {}
 
         for embedding_name in embedding_bundle.X_train:
             x_train = embedding_bundle.X_train[embedding_name]
             x_val = embedding_bundle.X_val[embedding_name]
+            x_test = embedding_bundle.X_test[embedding_name]
+
+            x_train_processed, x_val_processed, _ = self._apply_normalization(
+                x_train=x_train,
+                x_val=x_val,
+                x_test=x_test,
+                mode=normalization_mode,
+            )
+
             y_train = embedding_bundle.y_train
             y_val = embedding_bundle.y_val
             problem_spec = ProblemSpecification.from_labels(y_train)
@@ -60,14 +72,14 @@ class TrainingService:
                     "Training model_type=%s embedding=%s train_shape=%s val_shape=%s",
                     model_type,
                     embedding_name,
-                    tuple(x_train.shape),
-                    tuple(x_val.shape),
+                    tuple(x_train_processed.shape),
+                    tuple(x_val_processed.shape),
                 )
 
                 model = self.model_factory.create(
                     model_type=model_type,
                     params=params,
-                    input_size=int(x_train.shape[1]),
+                    input_size=int(x_train_processed.shape[1]),
                     output_size=int(problem_spec.output_size),
                 )
 
@@ -75,13 +87,13 @@ class TrainingService:
                     model = OneVsRestClassifier(model)
 
                 if hasattr(model, "fit") and hasattr(model, "predict_proba") and model_type.upper() != "MLP":
-                    model.fit(x_train, y_train_processed)
-                    val_probs = model.predict_proba(x_val)
+                    model.fit(x_train_processed, y_train_processed)
+                    val_probs = model.predict_proba(x_val_processed)
                 else:
                     if problem_spec.problem_type == "multilabel":
                         raise ValueError("MLP training is not supported for multilabel targets in this pipeline")
-                    model.fit(x_train, y_train, x_val, y_val)
-                    val_probs = model.predict_proba(x_val)
+                    model.fit(x_train_processed, y_train, x_val_processed, y_val)
+                    val_probs = model.predict_proba(x_val_processed)
 
                 y_pred = self._probs_to_predictions(
                     model=model,
@@ -123,6 +135,54 @@ class TrainingService:
             return dict(self.wandb_config.items())
 
         return dict(model_params.get(model_type, model_params.get(model_type.upper(), {})))
+
+    def _resolve_normalization_mode(self, config: dict[str, Any]) -> str:
+        feature_processing = config.get("feature_processing", {})
+        normalize_mode = "none"
+        if isinstance(feature_processing, Mapping):
+            normalize_mode = str(feature_processing.get("normalize", "none"))
+
+        if self.sweep_mode and self.wandb_config is not None:
+            if isinstance(self.wandb_config, Mapping):
+                if "normalize" in self.wandb_config:
+                    normalize_mode = str(self.wandb_config["normalize"])
+                wandb_feature_processing = self.wandb_config.get("feature_processing")
+                if isinstance(wandb_feature_processing, Mapping) and "normalize" in wandb_feature_processing:
+                    normalize_mode = str(wandb_feature_processing["normalize"])
+
+        normalized = normalize_mode.lower()
+        valid_modes = {"none", "l2", "standard"}
+        if normalized not in valid_modes:
+            raise ValueError(
+                f"Unsupported feature_processing.normalize: {normalize_mode}. "
+                f"Expected one of {sorted(valid_modes)}"
+            )
+        return normalized
+
+    def _apply_normalization(
+        self,
+        x_train: np.ndarray,
+        x_val: np.ndarray,
+        x_test: np.ndarray,
+        mode: str,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if mode == "none":
+            return np.asarray(x_train), np.asarray(x_val), np.asarray(x_test)
+
+        if mode == "l2":
+            self.logger.info("Applied L2 normalization (row-wise)")
+            return (
+                normalize(np.asarray(x_train), norm="l2", axis=1),
+                normalize(np.asarray(x_val), norm="l2", axis=1),
+                normalize(np.asarray(x_test), norm="l2", axis=1),
+            )
+
+        scaler = StandardScaler()
+        x_train_scaled = scaler.fit_transform(np.asarray(x_train))
+        x_val_scaled = scaler.transform(np.asarray(x_val))
+        x_test_scaled = scaler.transform(np.asarray(x_test))
+        self.logger.info("Applied StandardScaler (fit on train only)")
+        return x_train_scaled, x_val_scaled, x_test_scaled
 
     @staticmethod
     def _probs_to_predictions(model, val_probs: np.ndarray, problem_spec: ProblemSpecification) -> np.ndarray:
