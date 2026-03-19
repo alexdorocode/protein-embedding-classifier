@@ -5,6 +5,8 @@ import sys
 from protein_embedding_classifier.core.pipeline import Pipeline
 from protein_embedding_classifier.logging_config import configure_logging
 
+# poetry env use /home/alexdoro/.cache/pypoetry/virtualenvs/protein-embedding-classifier-l632joPH-py3.11/bin/python && poetry env info
+
 PIPELINE_STEPS = [
     "dataset",
     "embeddings",
@@ -14,13 +16,14 @@ PIPELINE_STEPS = [
     "benchmark",
     "evaluate",
 ]
+CLI_STEPS = [*PIPELINE_STEPS, "global_benchmark"]
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Protein Embedding Classifier Pipeline")
     parser.add_argument("--config", default="config/pipeline.yaml", help="Path to pipeline YAML config")
     parser.add_argument(
         "--step",
-        choices=[*PIPELINE_STEPS, "all"],
+        choices=[*CLI_STEPS, "all"],
         help="Execute a single pipeline step",
     )
     parser.add_argument("--train", action="store_true", help="Shortcut for --step train")
@@ -30,6 +33,11 @@ def main() -> None:
     parser.add_argument("--classifier", help="Run only the specified classifier")
     parser.add_argument("--embedding_group", help="Run embeddings from a configured embedding group")
     parser.add_argument("--run-prefix", help="Prefix for timestamped sweep run folders")
+    parser.add_argument(
+        "--n_seeds",
+        type=int,
+        help="Override number of seeds for --step global_benchmark",
+    )
     parser.add_argument(
         "--evaluate-last-sweep",
         action="store_true",
@@ -68,6 +76,7 @@ def main() -> None:
         },
         runtime_context={
             "run_prefix": args.run_prefix,
+            "n_seeds": args.n_seeds,
             "evaluate_last_sweep": bool(args.evaluate_last_sweep),
             "argv": list(sys.argv),
         },

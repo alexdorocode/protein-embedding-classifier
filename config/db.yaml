@@ -1,7 +1,7 @@
 db:
   host: localhost
   port: 5432
-  name: BioData_mfp_v0
+  name: BioData_mfp_v1
   user: usuario
   password: clave
 

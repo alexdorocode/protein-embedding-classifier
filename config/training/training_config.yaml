@@ -20,7 +20,7 @@ final_training:
   retrain_on_train_val: true
   evaluate_test: true
   save_model: true
-  output_dir: artifacts/final_models
+  output_dir: ../../pec_data/artifacts/final_models
 
 reporting:
   output_root: ../../pec_data

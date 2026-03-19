@@ -17,7 +17,7 @@ import time
 from importlib import metadata as importlib_metadata
 
 import yaml
-from sklearn.metrics import confusion_matrix, f1_score
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_score, recall_score
 from sklearn.preprocessing import MultiLabelBinarizer
 
 from protein_embedding_classifier.core.decision.decision_policy import decide
@@ -35,6 +35,13 @@ from protein_embedding_classifier.core.ensemble.soft_voting_service import (
 )
 from protein_embedding_classifier.core.embedding_loading import EmbeddingBundle, EmbeddingService
 from protein_embedding_classifier.core.probability.probability_adapter import ProbabilityAdapter
+from protein_embedding_classifier.core.statistics.friedman_test import run_friedman_test
+from protein_embedding_classifier.core.statistics.nemenyi_test import run_nemenyi_posthoc
+from protein_embedding_classifier.core.statistics.ranking_utils import (
+    build_score_matrix,
+    compute_average_ranks,
+    compute_rank_matrix,
+)
 from protein_embedding_classifier.core.training.problem_specification import ProblemSpecification
 from protein_embedding_classifier.core.training.sweep_service import SweepService
 from protein_embedding_classifier.core.training.training_service import TrainingService
@@ -173,6 +180,57 @@ def _benchmark_f1_score(
         return float(f1_score(y_true_bin, y_pred_bin, average="macro", zero_division=0))
 
     return float(f1_score(np.asarray(y_true), np.asarray(y_pred), average="macro", zero_division=0))
+
+
+def _benchmark_metrics(
+    problem_type: str,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    classes: Sequence[Any],
+) -> dict[str, float]:
+    if problem_type == "multilabel":
+        y_true_bin = _to_multilabel_matrix(y_true, classes)
+        pred_array = np.asarray(y_pred)
+        if pred_array.ndim == 2:
+            y_pred_bin = pred_array.astype(int)
+        else:
+            y_pred_bin = _to_multilabel_matrix(pred_array, classes)
+
+        if y_true_bin.shape != y_pred_bin.shape:
+            raise ValueError(
+                "Multilabel benchmark metric shape mismatch: "
+                f"y_true={y_true_bin.shape} y_pred={y_pred_bin.shape}"
+            )
+
+        return {
+            "accuracy": float("nan"),
+            "precision": float(precision_score(y_true_bin, y_pred_bin, average="macro", zero_division=0)),
+            "recall": float(recall_score(y_true_bin, y_pred_bin, average="macro", zero_division=0)),
+            "f1": float(f1_score(y_true_bin, y_pred_bin, average="macro", zero_division=0)),
+        }
+
+    y_true_arr = np.asarray(y_true)
+    y_pred_arr = np.asarray(y_pred)
+    return {
+        "accuracy": float(accuracy_score(y_true_arr, y_pred_arr)),
+        "precision": float(precision_score(y_true_arr, y_pred_arr, average="macro", zero_division=0)),
+        "recall": float(recall_score(y_true_arr, y_pred_arr, average="macro", zero_division=0)),
+        "f1": float(f1_score(y_true_arr, y_pred_arr, average="macro", zero_division=0)),
+    }
+
+
+def _safe_nanmean(values: np.ndarray) -> float:
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0 or not np.isfinite(arr).any():
+        return float("nan")
+    return float(np.nanmean(arr))
+
+
+def _safe_nanstd(values: np.ndarray) -> float:
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0 or not np.isfinite(arr).any():
+        return float("nan")
+    return float(np.nanstd(arr))
 
 
 class Pipeline:
@@ -316,10 +374,11 @@ class Pipeline:
     def run_dataset_step(self, conf: dict[str, Any]) -> None:
         bundle = self._build_dataset_bundle(conf)
         self.logger.info(
-            "Dataset bundle ready: train=%d val=%d test=%d",
+            "Dataset bundle ready: train=%d val=%d test=%d zero_shot=%d",
             len(bundle.train_ids),
             len(bundle.val_ids),
             len(bundle.test_ids),
+            len(getattr(bundle, "zero_shot_ids", [])),
         )
 
     def run_embeddings_step(self, conf: dict[str, Any]) -> None:
@@ -402,7 +461,10 @@ class Pipeline:
         train_conf = pipeline_conf.get("train", {})
         sweep_conf = pipeline_conf.get("sweep", {})
         training_global_conf = self._load_training_config(pipeline_conf)
-        reporting_conf = self._build_reporting_config(training_global_conf)
+        reporting_conf = self._with_runtime_reporting_overrides(
+            self._build_reporting_config(training_global_conf)
+        )
+        seed_used = self._resolve_seed_used(pipeline_conf)
 
         path_layout = self._ensure_pec_data_layout(reporting_conf)
         run_prefix = str(self.runtime_context.get("run_prefix") or reporting_conf.get("run_prefix", "sweep"))
@@ -485,7 +547,7 @@ class Pipeline:
             )
             sweep_yaml = self._load_yaml(sweep_config_path)
 
-            sweep_service = SweepService(model_type=current_model_type)
+            sweep_service = SweepService(model_type=current_model_type, rng_seed=seed_used)
             try:
                 result = sweep_service.run(
                     embedding_bundle=embedding_bundle,
@@ -493,6 +555,7 @@ class Pipeline:
                     num_trials=num_trials,
                     training_config={
                         **dict(train_conf),
+                        "evaluate_test": bool(train_conf.get("evaluate_test", True)),
                         "threshold_policy": reporting_conf.get("thresholds", {}),
                     },
                     wandb_project=wandb_project,
@@ -518,7 +581,15 @@ class Pipeline:
                 "best_key": result.best_key,
                 "sweep_config_path": sweep_config_path,
             }
-            all_trial_results.extend(result.trial_results)
+            all_trial_results.extend(
+                [
+                    {
+                        **dict(row),
+                        "seed_used": int(seed_used),
+                    }
+                    for row in result.trial_results
+                ]
+            )
             self.logger.info(
                 "Finished classifier sweep model_type=%s best_embedding=%s validation_f1=%.6f",
                 current_model_type,
@@ -541,6 +612,8 @@ class Pipeline:
                     wandb_project=wandb_project,
                     wandb_entity=wandb_entity,
                 )
+                for row in final_rows:
+                    row["seed_used"] = int(seed_used)
                 final_test_rows.extend(final_rows)
 
         if not best_results:
@@ -567,7 +640,12 @@ class Pipeline:
         self.logger.info("Saved per-classifier sweep results artifact: %s", per_classifier_path)
 
         full_results_csv = reports_dir / "sweep_results_full.csv"
-        self._write_full_sweep_results_csv(full_results_csv, all_trial_results)
+        self._write_full_sweep_results_csv(
+            full_results_csv,
+            all_trial_results,
+            final_test_rows=final_test_rows,
+            seed_used=int(seed_used),
+        )
         self.logger.info("Saved full sweep results CSV artifact: %s", full_results_csv)
 
         best_per_classifier_csv = reports_dir / "best_per_classifier.csv"
@@ -575,6 +653,10 @@ class Pipeline:
         self.logger.info("Saved per-classifier sweep CSV artifact: %s", best_per_classifier_csv)
 
         best_classifier_per_embedding = self._select_best_classifier_per_embedding(all_trial_results)
+        self._attach_model_artifacts_to_best_rows(
+            best_classifier_per_embedding=best_classifier_per_embedding,
+            final_test_rows=final_test_rows,
+        )
         best_classifier_per_embedding_csv = reports_dir / "best_classifier_per_embedding.csv"
         self._write_best_classifier_per_embedding_csv(best_classifier_per_embedding_csv, best_classifier_per_embedding)
         self.logger.info("Saved best classifier per embedding CSV artifact: %s", best_classifier_per_embedding_csv)
@@ -585,11 +667,6 @@ class Pipeline:
         )
         self.logger.info("Validation summary table (F1):\n%s", summary_table)
 
-        if final_test_rows:
-            final_test_path = reports_dir / "final_test_results.csv"
-            self._write_final_test_results_csv(final_test_path, final_test_rows)
-            self.logger.info("Saved final test results CSV artifact: %s", final_test_path)
-
         self._save_run_methodology_snapshot(
             configs_dir=configs_dir,
             pipeline_conf=pipeline_conf,
@@ -599,16 +676,17 @@ class Pipeline:
             selected_classifiers=sorted(selected_classifier_sweeps.keys()),
             run_started_at=run_started_at,
             run_duration_seconds=float(time.time() - run_started_ts),
+            seed_used=seed_used,
         )
 
-        predictions_csv = predictions_dir / "predictions_test.csv"
-        self._write_test_predictions_csv(
+        predictions_csv = predictions_dir / f"predictions_seed_{int(seed_used)}.csv"
+        self._write_seed_predictions_csv(
             path=predictions_csv,
             dataset_bundle=dataset_bundle,
             embedding_bundle=embedding_bundle,
             final_test_rows=final_test_rows,
-            best_classifier_per_embedding=best_classifier_per_embedding,
             threshold_conf=reporting_conf.get("thresholds", {}),
+            seed_used=int(seed_used),
         )
         self.logger.info("Saved test predictions CSV artifact: %s", predictions_csv)
 
@@ -627,7 +705,9 @@ class Pipeline:
         embeddings_config_path = embeddings_step_conf.get("config_path", "config/embeddings.yaml")
         embeddings_conf = self._load_yaml(embeddings_config_path)
         training_global_conf = self._load_training_config(pipeline_conf)
-        reporting_conf = self._build_reporting_config(training_global_conf)
+        reporting_conf = self._with_runtime_reporting_overrides(
+            self._build_reporting_config(training_global_conf)
+        )
         path_layout = self._ensure_pec_data_layout(reporting_conf)
 
         source_conf = ensemble_conf.get("source", {}) if isinstance(ensemble_conf.get("source", {}), Mapping) else {}
@@ -755,7 +835,9 @@ class Pipeline:
         embeddings_config_path = embeddings_step_conf.get("config_path", "config/embeddings.yaml")
         embeddings_conf = self._load_yaml(embeddings_config_path)
         training_global_conf = self._load_training_config(pipeline_conf)
-        reporting_conf = self._build_reporting_config(training_global_conf)
+        reporting_conf = self._with_runtime_reporting_overrides(
+            self._build_reporting_config(training_global_conf)
+        )
         path_layout = self._ensure_pec_data_layout(reporting_conf)
 
         latest_run_dir = self._get_latest_sweep_run(path_layout["sweep"])
@@ -843,17 +925,43 @@ class Pipeline:
 
                     x_val_map = {name: np.asarray(values) for name, values in embedding_bundle.X_val.items()}
                     x_test_map = {name: np.asarray(values) for name, values in embedding_bundle.X_test.items()}
+                    x_zero_map = {name: np.asarray(values) for name, values in embedding_bundle.X_zero_shot.items()}
                     y_val = np.asarray(dataset_bundle.y_val)
                     y_test = np.asarray(dataset_bundle.y_test)
+                    y_zero = np.asarray(getattr(dataset_bundle, "y_zero_shot", np.asarray([], dtype=object)))
+                    if y_zero.shape[0] == 0:
+                        self.logger.warning("Zero-shot split is empty; zero-shot scoring will be skipped for this run")
+                    elif y_zero.shape[0] < 10:
+                        self.logger.warning(
+                            "Zero-shot split has very small sample size (n=%d); metrics may be statistically unstable",
+                            int(y_zero.shape[0]),
+                        )
+
+                    benchmark_predictions_seed_dir = results_dir / "benchmark_predictions" / f"seed_{int(seed)}"
+                    benchmark_predictions_seed_dir.mkdir(parents=True, exist_ok=True)
+
+                    train_set = set(dataset_bundle.train_ids)
+                    val_set = set(dataset_bundle.val_ids)
+                    test_set = set(dataset_bundle.test_ids)
+                    zero_set = set(getattr(dataset_bundle, "zero_shot_ids", []))
+                    if train_set.intersection(zero_set):
+                        raise ValueError("Leakage detected: intersection(train, zero_shot) is non-empty")
+                    if val_set.intersection(zero_set):
+                        raise ValueError("Leakage detected: intersection(validation, zero_shot) is non-empty")
+                    if test_set.intersection(zero_set):
+                        raise ValueError("Leakage detected: intersection(test, zero_shot) is non-empty")
+                    self.logger.info("Zero-shot verified as isolated holdout.")
 
                     per_model_scores: list[dict[str, Any]] = []
                     for artifact in model_artifacts:
-                        val_score, test_score, diagnostics = self._evaluate_model_artifact_scores(
+                        val_metrics, test_metrics, zero_metrics, diagnostics = self._evaluate_model_artifact_scores(
                             artifact=artifact,
                             x_val_map=x_val_map,
                             y_val=y_val,
                             x_test_map=x_test_map,
                             y_test=y_test,
+                            x_zero_map=x_zero_map,
+                            y_zero=y_zero,
                             include_diagnostics=True,
                         )
                         per_model_scores.append(
@@ -861,8 +969,12 @@ class Pipeline:
                                 "model": f"{artifact.classifier_name}::{artifact.embedding_name}",
                                 "classifier_name": artifact.classifier_name,
                                 "embedding_name": artifact.embedding_name,
-                                "validation_f1": val_score,
-                                "test_f1": test_score,
+                                "validation_metrics": val_metrics,
+                                "test_metrics": test_metrics,
+                                "zero_shot_metrics": zero_metrics,
+                                "validation_f1": float(val_metrics.get("f1", float("nan"))),
+                                "test_f1": float(test_metrics.get("f1", float("nan"))),
+                                "zero_shot_f1": float(zero_metrics.get("f1", float("nan"))) if zero_metrics else float("nan"),
                                 "diagnostics": diagnostics,
                             }
                         )
@@ -874,8 +986,12 @@ class Pipeline:
                         {
                             "category": "Single",
                             "variant": "best_single",
+                            "validation_metrics": dict(best_single.get("validation_metrics", {})),
+                            "test_metrics": dict(best_single.get("test_metrics", {})),
+                            "zero_shot_metrics": dict(best_single.get("zero_shot_metrics", {})) if best_single.get("zero_shot_metrics") else None,
                             "validation_f1": float(best_single["validation_f1"]),
                             "test_f1": float(best_single["test_f1"]),
+                            "zero_shot_f1": float(best_single.get("zero_shot_f1", float("nan"))),
                             "num_models": 1,
                             "weighting_strategy": "n/a",
                             "mode": "single",
@@ -898,8 +1014,13 @@ class Pipeline:
                                 y_val=y_val,
                                 x_test_map=x_test_map,
                                 y_test=y_test,
+                                x_zero_map=x_zero_map,
+                                y_zero=y_zero,
                                 selected_payloads=selected_payloads,
                                 benchmark_models_dir=benchmark_models_dir,
+                                seed=seed,
+                                test_ids=list(dataset_bundle.test_ids),
+                                benchmark_predictions_seed_dir=benchmark_predictions_seed_dir,
                             )
                             benchmark_results.append(result_row)
                         except Exception as exc:
@@ -917,12 +1038,15 @@ class Pipeline:
                         )
 
                     best_single_test = float(best_single["test_f1"])
+                    best_single_zero = float(best_single.get("zero_shot_f1", float("nan")))
                     for row in benchmark_results:
                         delta = float(row.get("test_f1", float("nan"))) - best_single_test
+                        zero_delta = float(row.get("zero_shot_f1", float("nan"))) - best_single_zero
                         gap = float(row.get("validation_f1", float("nan"))) - float(row.get("test_f1", float("nan")))
                         row.update(
                             {
                                 "delta_vs_best_single_test": delta,
+                                "delta_vs_best_single_zero_shot": zero_delta,
                                 "generalization_gap": gap,
                                 "seed": seed,
                                 "ablation": ablation_name,
@@ -930,12 +1054,13 @@ class Pipeline:
                         )
                         seed_level_rows.append(dict(row))
                         self.logger.info(
-                            "Benchmark seed=%d ablation=%s variant=%s val_f1=%.4f test_f1=%.4f gap=%.4f",
+                            "Benchmark seed=%d ablation=%s variant=%s val_f1=%.4f test_f1=%.4f zero_f1=%.4f gap=%.4f",
                             seed,
                             ablation_name,
                             row.get("variant"),
                             float(row.get("validation_f1", float("nan"))),
                             float(row.get("test_f1", float("nan"))),
+                            float(row.get("zero_shot_f1", float("nan"))),
                             gap,
                         )
 
@@ -949,6 +1074,7 @@ class Pipeline:
                                     "models_used": list(row.get("models_used") or []),
                                     "validation_f1": float(row.get("validation_f1", float("nan"))),
                                     "test_f1": float(row.get("test_f1", float("nan"))),
+                                    "zero_shot_f1": float(row.get("zero_shot_f1", float("nan"))),
                                     "model_validation_scores": dict(row.get("model_validation_scores", {})),
                                 }
                             )
@@ -1015,6 +1141,11 @@ class Pipeline:
                 "timestamp_utc": datetime.utcnow().isoformat() + "Z",
                 "git_commit": self._git_commit(),
                 "seeds": seeds,
+                "seed_used": (
+                    int(self.runtime_context.get("seed_used"))
+                    if self.runtime_context.get("seed_used") is not None
+                    else None
+                ),
                 "artifact_hashes": artifact_hashes,
                 "config_snapshot": {
                     "pipeline": pipeline_conf,
@@ -1046,6 +1177,199 @@ class Pipeline:
         self.logger.info("Saved benchmark multiseed JSON artifact: %s", multiseed_json)
         self.logger.info("Saved benchmark weight analysis artifact: %s", weights_json)
         self.logger.info("Saved benchmark ablation summary artifact: %s", ablation_csv)
+
+    def run_global_benchmark_step(self, conf: dict[str, Any]) -> None:
+        pipeline_conf = conf if "dataset" in conf else self._load_yaml(self.config_path)
+
+        experiment_conf = (
+            pipeline_conf.get("experiment", {})
+            if isinstance(pipeline_conf.get("experiment", {}), Mapping)
+            else {}
+        )
+        experiment_global_benchmark_conf = (
+            experiment_conf.get("global_benchmark", {})
+            if isinstance(experiment_conf.get("global_benchmark", {}), Mapping)
+            else {}
+        )
+        step_global_benchmark_conf = (
+            pipeline_conf.get("global_benchmark", {})
+            if isinstance(pipeline_conf.get("global_benchmark", {}), Mapping)
+            else {}
+        )
+
+        main_seed = int(experiment_conf.get("main_seed", 42))
+        configured_n_seeds = experiment_global_benchmark_conf.get(
+            "n_seeds",
+            step_global_benchmark_conf.get("n_seeds", 10),
+        )
+        cli_n_seeds = self.runtime_context.get("n_seeds")
+        n_seeds = int(cli_n_seeds) if cli_n_seeds is not None else int(configured_n_seeds)
+        if n_seeds <= 0:
+            raise ValueError("global_benchmark n_seeds must be >= 1")
+
+        generated_seeds = self._generate_deterministic_seeds(main_seed=main_seed, n_seeds=n_seeds)
+
+        training_global_conf = self._load_training_config(pipeline_conf)
+        reporting_conf = self._with_runtime_reporting_overrides(
+            self._build_reporting_config(training_global_conf)
+        )
+        path_layout = self._ensure_pec_data_layout(reporting_conf)
+
+        benchmark_conf = (
+            pipeline_conf.get("benchmark", {})
+            if isinstance(pipeline_conf.get("benchmark", {}), Mapping)
+            else {}
+        )
+        metric_name = str(benchmark_conf.get("metric", "f1_macro"))
+        variant_specs = self._build_benchmark_variant_specs(
+            metric_name=metric_name,
+            include_uniform=bool(benchmark_conf.get("include_uniform", True)),
+            include_validation_weighted=bool(benchmark_conf.get("include_validation_weighted", True)),
+            include_trainable=bool(benchmark_conf.get("include_trainable", True)),
+            include_majority=bool(benchmark_conf.get("include_majority", True)),
+            trainable_params=benchmark_conf.get("trainable_params", {}),
+        )
+        expected_ensemble_strategies = [str(spec.get("variant", "")).strip() for spec in variant_specs if str(spec.get("variant", "")).strip()]
+        expected_model_combinations = self._expected_global_model_embedding_combinations(
+            pipeline_conf=pipeline_conf,
+            training_global_conf=training_global_conf,
+        )
+
+        global_benchmark_dir = path_layout["results"] / "global_benchmark"
+        executions_dir = global_benchmark_dir / "executions"
+        aggregated_dir = global_benchmark_dir / "aggregated"
+        predictions_root = global_benchmark_dir / "predictions"
+        model_predictions_dir = predictions_root / "model_predictions"
+        ensemble_predictions_dir = predictions_root / "ensemble_predictions"
+        statistics_dir = global_benchmark_dir / "statistics"
+        metadata_dir = global_benchmark_dir / "metadata"
+
+        global_benchmark_dir.mkdir(parents=True, exist_ok=True)
+        for folder in (
+            executions_dir,
+            aggregated_dir,
+            model_predictions_dir,
+            ensemble_predictions_dir,
+            statistics_dir,
+            metadata_dir,
+        ):
+            folder.mkdir(parents=True, exist_ok=True)
+
+        exp_prefix = str(self.runtime_context.get("run_prefix") or reporting_conf.get("run_prefix", "experiment"))
+        seed_tracking_file = metadata_dir / "experiment_seeds.json"
+        seed_tracking_payload = {
+            "main_seed": main_seed,
+            "generated_seeds": generated_seeds,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "n_seeds": n_seeds,
+            "run_prefix": exp_prefix,
+        }
+        with seed_tracking_file.open("w", encoding="utf-8") as handle:
+            json.dump(seed_tracking_payload, handle, indent=2)
+
+        config_snapshot_file = metadata_dir / "experiment_config_snapshot.yaml"
+        with config_snapshot_file.open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(
+                {
+                    "pipeline": pipeline_conf,
+                    "training": training_global_conf,
+                    "runtime_filters": self.runtime_filters,
+                    "runtime_context": self.runtime_context,
+                },
+                handle,
+                sort_keys=False,
+            )
+
+        self.logger.info(
+            "Global benchmark configured main_seed=%d n_seeds=%d executions_dir=%s",
+            main_seed,
+            n_seeds,
+            executions_dir,
+        )
+        self.logger.info("Saved global benchmark seed tracking file: %s", seed_tracking_file)
+        self.logger.info("Saved global benchmark config snapshot file: %s", config_snapshot_file)
+
+        original_runtime_context = dict(self.runtime_context)
+        try:
+            for seed in generated_seeds:
+                execution_root = executions_dir / f"run_seed_{seed}"
+                execution_root.mkdir(parents=True, exist_ok=True)
+
+                self.runtime_context = {
+                    **original_runtime_context,
+                    "seed_used": int(seed),
+                    "output_root_override": str(execution_root),
+                }
+                seeded_pipeline_conf = self._with_seeded_pipeline_config(pipeline_conf, int(seed))
+
+                self.logger.info(
+                    "Global benchmark execution start seed=%d output_root=%s",
+                    seed,
+                    execution_root,
+                )
+                self.run_sweep_step(seeded_pipeline_conf)
+                self.run_ensemble_step(seeded_pipeline_conf)
+                self.run_benchmark_step(seeded_pipeline_conf)
+                self.logger.info("Global benchmark execution finished seed=%d", seed)
+        finally:
+            self.runtime_context = original_runtime_context
+
+        self._aggregate_global_benchmark_outputs(
+            global_benchmark_dir=global_benchmark_dir,
+            executions_dir=executions_dir,
+            aggregated_dir=aggregated_dir,
+            model_predictions_export_dir=model_predictions_dir,
+            ensemble_predictions_export_dir=ensemble_predictions_dir,
+            expected_seeds=generated_seeds,
+            expected_model_combinations=expected_model_combinations,
+            expected_ensemble_strategies=expected_ensemble_strategies,
+        )
+
+    def _expected_global_model_embedding_combinations(
+        self,
+        pipeline_conf: dict[str, Any],
+        training_global_conf: dict[str, Any],
+    ) -> set[tuple[str, str]]:
+        sweep_conf = (
+            pipeline_conf.get("sweep", {}) if isinstance(pipeline_conf.get("sweep", {}), Mapping) else {}
+        )
+        classifier_sweeps = self._resolve_classifier_sweeps(dict(sweep_conf))
+        selected_classifiers = self._resolve_selected_classifiers(
+            available=list(classifier_sweeps.keys()),
+            filters=self.runtime_filters,
+            training_global_conf=training_global_conf,
+        )
+
+        embeddings_step_conf = (
+            pipeline_conf.get("embeddings", {}) if isinstance(pipeline_conf.get("embeddings", {}), Mapping) else {}
+        )
+        embeddings_config_path = embeddings_step_conf.get("config_path", "config/embeddings.yaml")
+        embeddings_conf = self._load_yaml(embeddings_config_path)
+        available_embeddings = self._enumerate_enabled_embedding_names(embeddings_conf)
+        selected_embeddings = self._resolve_selected_embeddings(
+            available=available_embeddings,
+            filters=self.runtime_filters,
+            training_global_conf=training_global_conf,
+        )
+
+        return {
+            (str(classifier), str(embedding_name))
+            for classifier in selected_classifiers
+            for embedding_name in selected_embeddings
+        }
+
+    @staticmethod
+    def _enumerate_enabled_embedding_names(embeddings_conf: dict[str, Any]) -> list[str]:
+        names: set[str] = set()
+        for section_name in ("sequencePE", "GOPE", "structurePE"):
+            section = embeddings_conf.get(section_name, {}) if isinstance(embeddings_conf.get(section_name, {}), Mapping) else {}
+            models = section.get("models", {}) if isinstance(section.get("models", {}), Mapping) else {}
+            for model_name, model_conf in models.items():
+                if not isinstance(model_conf, Mapping):
+                    continue
+                if bool(model_conf.get("enabled", False)):
+                    names.add(str(model_name))
+        return sorted(names)
 
     def _build_soft_voting_service_config(
         self,
@@ -1179,9 +1503,1427 @@ class Pipeline:
     @staticmethod
     def _with_seeded_dataset_config(dataset_conf: dict[str, Any], seed: int) -> dict[str, Any]:
         cloned = copy.deepcopy(dataset_conf)
-        if isinstance(cloned.get("split"), Mapping):
-            cloned["split"]["random_state"] = int(seed)
+        split_conf_raw = cloned.get("split")
+        if isinstance(split_conf_raw, Mapping):
+            split_conf = dict(split_conf_raw)
+            cloned["split"] = split_conf
+            split_conf["random_state"] = int(seed)
+
+            validation_conf_raw = split_conf.get("validation")
+            if isinstance(validation_conf_raw, Mapping):
+                validation_conf = dict(validation_conf_raw)
+                split_conf["validation"] = validation_conf
+                random_conf_raw = validation_conf.get("random", {})
+                random_conf = dict(random_conf_raw) if isinstance(random_conf_raw, Mapping) else {}
+                random_conf["random_state"] = int(seed)
+                validation_conf["random"] = random_conf
+
+            train_test_conf_raw = split_conf.get("train_test")
+            if isinstance(train_test_conf_raw, Mapping):
+                train_test_conf = dict(train_test_conf_raw)
+                split_conf["train_test"] = train_test_conf
+
+                random_conf_raw = train_test_conf.get("random", {})
+                random_conf = dict(random_conf_raw) if isinstance(random_conf_raw, Mapping) else {}
+                random_conf["random_state"] = int(seed)
+                train_test_conf["random"] = random_conf
+
+                cv_conf_raw = train_test_conf.get("cross_validation", {})
+                cv_conf = dict(cv_conf_raw) if isinstance(cv_conf_raw, Mapping) else {}
+                cv_conf["random_state"] = int(seed)
+                train_test_conf["cross_validation"] = cv_conf
+
+            zero_shot_conf_raw = split_conf.get("zero_shot")
+            if isinstance(zero_shot_conf_raw, Mapping):
+                zero_shot_conf = dict(zero_shot_conf_raw)
+                split_conf["zero_shot"] = zero_shot_conf
+                random_conf_raw = zero_shot_conf.get("random", {})
+                random_conf = dict(random_conf_raw) if isinstance(random_conf_raw, Mapping) else {}
+                random_conf["random_state"] = int(seed)
+                zero_shot_conf["random"] = random_conf
+
         return cloned
+
+    @classmethod
+    def _with_seeded_pipeline_config(cls, pipeline_conf: dict[str, Any], seed: int) -> dict[str, Any]:
+        cloned = copy.deepcopy(pipeline_conf)
+        dataset_conf_raw = cloned.get("dataset")
+        if isinstance(dataset_conf_raw, Mapping):
+            cloned["dataset"] = cls._with_seeded_dataset_config(dict(dataset_conf_raw), int(seed))
+
+        benchmark_conf_raw = cloned.get("benchmark", {})
+        benchmark_conf = dict(benchmark_conf_raw) if isinstance(benchmark_conf_raw, Mapping) else {}
+        benchmark_conf["seeds"] = [int(seed)]
+        cloned["benchmark"] = benchmark_conf
+        return cloned
+
+    @staticmethod
+    def _generate_deterministic_seeds(main_seed: int, n_seeds: int) -> list[int]:
+        count = int(n_seeds)
+        if count <= 0:
+            raise ValueError("n_seeds must be >= 1")
+        seed_start = int(main_seed)
+        return [seed_start + offset for offset in range(count)]
+
+    def _aggregate_global_benchmark_outputs(
+        self,
+        global_benchmark_dir: Path,
+        executions_dir: Path,
+        aggregated_dir: Path,
+        model_predictions_export_dir: Path,
+        ensemble_predictions_export_dir: Path,
+        expected_seeds: Sequence[int],
+        expected_model_combinations: set[tuple[str, str]] | None = None,
+        expected_ensemble_strategies: Sequence[str] | None = None,
+    ) -> None:
+        execution_payloads = self._collect_global_benchmark_execution_payloads(
+            executions_dir=executions_dir,
+            expected_seeds=expected_seeds,
+        )
+        if not execution_payloads:
+            self.logger.warning(
+                "Global benchmark aggregation skipped: no benchmark_summary.json found under %s",
+                executions_dir,
+            )
+            return
+
+        model_seed_rows: list[dict[str, Any]] = []
+        ensemble_seed_rows: list[dict[str, Any]] = []
+
+        for payload in execution_payloads:
+            seed = int(payload.get("seed", -1))
+            summary = payload.get("summary", {})
+            if not isinstance(summary, Mapping):
+                continue
+
+            model_predictions_csv = payload.get("model_predictions_csv")
+            model_rows = self._model_rows_from_global_execution_predictions(
+                seed=seed,
+                predictions_csv=model_predictions_csv if isinstance(model_predictions_csv, Path) else None,
+            )
+            if not model_rows:
+                confusion_by_model = self._prediction_confusions_by_model(
+                    model_predictions_csv if isinstance(model_predictions_csv, Path) else None
+                )
+                model_rows = self._model_rows_from_global_execution_summary(
+                    seed=seed,
+                    summary=summary,
+                    confusion_by_model=confusion_by_model,
+                )
+            model_seed_rows.extend(model_rows)
+
+            self._export_model_prediction_files(
+                seed=seed,
+                predictions_csv=model_predictions_csv if isinstance(model_predictions_csv, Path) else None,
+                model_predictions_export_dir=model_predictions_export_dir,
+            )
+
+            ensemble_prediction_seed_dir = payload.get("ensemble_predictions_dir")
+            ensemble_metrics = self._ensemble_metrics_from_prediction_files(
+                ensemble_prediction_seed_dir if isinstance(ensemble_prediction_seed_dir, Path) else None
+            )
+            self._export_ensemble_prediction_files(
+                seed=seed,
+                ensemble_prediction_seed_dir=ensemble_prediction_seed_dir if isinstance(ensemble_prediction_seed_dir, Path) else None,
+                ensemble_predictions_export_dir=ensemble_predictions_export_dir,
+            )
+
+            ensemble_seed_rows.extend(
+                self._ensemble_rows_from_global_execution_summary(
+                    seed=seed,
+                    summary=summary,
+                    ensemble_metrics=ensemble_metrics,
+                )
+            )
+
+        expected_model_combinations = expected_model_combinations or set()
+        expected_ensemble_strategies = [
+            str(item).strip() for item in (expected_ensemble_strategies or []) if str(item).strip()
+        ]
+
+        self._log_global_combination_coverage(
+            expected_model_combinations=expected_model_combinations,
+            model_seed_rows=model_seed_rows,
+            expected_ensemble_strategies=expected_ensemble_strategies,
+            ensemble_seed_rows=ensemble_seed_rows,
+            expected_seeds=expected_seeds,
+        )
+
+        self._assign_rankings_per_seed(model_seed_rows)
+        self._assign_rankings_per_seed(ensemble_seed_rows)
+
+        model_rows = self._aggregate_global_seed_rows(model_seed_rows)
+        ensemble_rows = self._aggregate_global_seed_rows(ensemble_seed_rows)
+
+        model_rows = self._append_missing_expected_model_rows(
+            aggregated_rows=model_rows,
+            expected_model_combinations=expected_model_combinations,
+        )
+        ensemble_rows = self._append_missing_expected_ensemble_rows(
+            aggregated_rows=ensemble_rows,
+            expected_ensemble_strategies=expected_ensemble_strategies,
+        )
+
+        model_csv = aggregated_dir / "model_embedding_benchmark.csv"
+        ensemble_csv = aggregated_dir / "ensemble_strategy_benchmark.csv"
+        ranking_csv = aggregated_dir / "ranking_tables.csv"
+
+        self._write_global_benchmark_table_csv(model_csv, model_rows)
+        self._write_global_benchmark_table_csv(ensemble_csv, ensemble_rows)
+        self._write_global_benchmark_ranking_table_csv(
+            path=ranking_csv,
+            model_rows=model_rows,
+            ensemble_rows=ensemble_rows,
+        )
+
+        self._run_global_benchmark_statistical_analysis(
+            global_benchmark_dir=global_benchmark_dir,
+            model_seed_rows=model_seed_rows,
+            ensemble_seed_rows=ensemble_seed_rows,
+        )
+
+        self.logger.info("Saved global benchmark model embedding CSV artifact: %s", model_csv)
+        self.logger.info("Saved global benchmark ensemble strategy CSV artifact: %s", ensemble_csv)
+        self.logger.info("Saved global benchmark ranking CSV artifact: %s", ranking_csv)
+
+    def _collect_global_benchmark_execution_payloads(
+        self,
+        executions_dir: Path,
+        expected_seeds: Sequence[int],
+    ) -> list[dict[str, Any]]:
+        if not executions_dir.exists():
+            return []
+
+        expected_seed_set = {int(seed) for seed in expected_seeds}
+        payloads: list[dict[str, Any]] = []
+
+        for execution_dir in sorted([path for path in executions_dir.iterdir() if path.is_dir()]):
+            seed = self._extract_seed_from_execution_dir_name(execution_dir.name)
+            if seed is None or seed not in expected_seed_set:
+                continue
+
+            sweep_root = execution_dir / "sweep"
+            if not sweep_root.exists() or not sweep_root.is_dir():
+                self.logger.warning(
+                    "Skipping global benchmark aggregation for seed=%d: sweep directory missing in %s",
+                    seed,
+                    execution_dir,
+                )
+                continue
+
+            latest_sweep_run = self._get_latest_sweep_run(sweep_root)
+            if latest_sweep_run is None:
+                self.logger.warning(
+                    "Skipping global benchmark aggregation for seed=%d: no sweep run found in %s",
+                    seed,
+                    sweep_root,
+                )
+                continue
+
+            summary_json = latest_sweep_run / "results" / "benchmark_summary.json"
+            if not summary_json.exists():
+                self.logger.warning(
+                    "Skipping global benchmark aggregation for seed=%d: benchmark summary missing at %s",
+                    seed,
+                    summary_json,
+                )
+                continue
+
+            try:
+                with summary_json.open("r", encoding="utf-8") as handle:
+                    summary_payload = json.load(handle)
+            except Exception as exc:
+                self.logger.warning(
+                    "Skipping global benchmark aggregation for seed=%d due to invalid JSON at %s: %s",
+                    seed,
+                    summary_json,
+                    exc,
+                )
+                continue
+
+            payloads.append(
+                {
+                    "seed": int(seed),
+                    "summary": summary_payload,
+                    "sweep_run_dir": latest_sweep_run,
+                    "model_predictions_csv": self._resolve_predictions_csv_for_seed(latest_sweep_run, int(seed)),
+                    "ensemble_predictions_dir": self._resolve_benchmark_ensemble_predictions_dir_for_seed(
+                        latest_sweep_run,
+                        int(seed),
+                    ),
+                }
+            )
+
+        return sorted(payloads, key=lambda item: int(item.get("seed", -1)))
+
+    @staticmethod
+    def _resolve_benchmark_ensemble_predictions_dir_for_seed(sweep_run_dir: Path, seed: int) -> Path | None:
+        prediction_dir = sweep_run_dir / "results" / "benchmark_predictions" / f"seed_{int(seed)}"
+        if prediction_dir.exists() and prediction_dir.is_dir():
+            return prediction_dir
+        return None
+
+    @staticmethod
+    def _extract_seed_from_execution_dir_name(name: str) -> int | None:
+        if not str(name).startswith("run_seed_"):
+            return None
+        raw_seed = str(name).split("run_seed_", 1)[1]
+        if raw_seed == "":
+            return None
+        try:
+            return int(raw_seed)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _resolve_predictions_csv_for_seed(sweep_run_dir: Path, seed: int) -> Path | None:
+        predictions_dir = sweep_run_dir / "predictions"
+        if not predictions_dir.exists() or not predictions_dir.is_dir():
+            return None
+
+        expected = predictions_dir / f"predictions_seed_{int(seed)}.csv"
+        if expected.exists():
+            return expected
+
+        candidates = sorted(
+            [path for path in predictions_dir.glob("predictions_seed_*.csv") if path.is_file()],
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        return candidates[0] if candidates else None
+
+    @staticmethod
+    def _model_rows_from_global_execution_predictions(
+        seed: int,
+        predictions_csv: Path | None,
+    ) -> list[dict[str, Any]]:
+        if predictions_csv is None or not predictions_csv.exists():
+            return []
+
+        grouped_pairs: dict[tuple[str, str], list[tuple[Any, Any]]] = {}
+        with predictions_csv.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                model_type = str(row.get("model_type", "")).strip()
+                embedding_name = str(row.get("embedding_name", "")).strip()
+                true_label = row.get("true_label")
+                predicted_label = row.get("predicted_label")
+
+                if not model_type or not embedding_name:
+                    continue
+                if true_label is None or predicted_label is None:
+                    continue
+
+                grouped_pairs.setdefault((model_type, embedding_name), []).append((true_label, predicted_label))
+
+        rows: list[dict[str, Any]] = []
+        for (model_type, embedding_name), pairs in grouped_pairs.items():
+            metrics = Pipeline._binary_metrics_and_confusion_from_pairs(pairs)
+            if not metrics:
+                continue
+            rows.append(
+                {
+                    "seed": int(seed),
+                    "model_type": model_type,
+                    "embedding_name": embedding_name,
+                    "strategy": "single",
+                    "accuracy": float(metrics.get("accuracy", 0.0)),
+                    "precision": float(metrics.get("precision", 0.0)),
+                    "recall": float(metrics.get("recall", 0.0)),
+                    "f1": float(metrics.get("f1", 0.0)),
+                    "TP": float(metrics.get("TP", 0.0)),
+                    "TN": float(metrics.get("TN", 0.0)),
+                    "FP": float(metrics.get("FP", 0.0)),
+                    "FN": float(metrics.get("FN", 0.0)),
+                    "rank": float("nan"),
+                }
+            )
+
+        return rows
+
+    @staticmethod
+    def _model_rows_from_global_execution_summary(
+        seed: int,
+        summary: Mapping[str, Any],
+        confusion_by_model: Mapping[tuple[str, str], dict[str, float]],
+    ) -> list[dict[str, Any]]:
+        raw_models = summary.get("models_evaluated", [])
+        if not isinstance(raw_models, list):
+            return []
+
+        rows: list[dict[str, Any]] = []
+        for item in raw_models:
+            if not isinstance(item, Mapping):
+                continue
+
+            model_type = str(item.get("classifier_name", "")).strip()
+            embedding_name = str(item.get("embedding_name", "")).strip()
+            model_ref = str(item.get("model", "")).strip()
+
+            if not model_type and "::" in model_ref:
+                model_type = model_ref.split("::", 1)[0].strip()
+            if not embedding_name and "::" in model_ref:
+                embedding_name = model_ref.split("::", 1)[1].strip()
+
+            if not model_type or not embedding_name:
+                continue
+
+            test_metrics = item.get("test_metrics", {})
+            metrics = dict(test_metrics) if isinstance(test_metrics, Mapping) else {}
+
+            confusion = dict(confusion_by_model.get((model_type, embedding_name), {}))
+            if not confusion:
+                diagnostics = item.get("diagnostics", {}) if isinstance(item.get("diagnostics", {}), Mapping) else {}
+                confusion = Pipeline._binary_confusion_counts_from_matrix(diagnostics.get("confusion_matrix"))
+
+            rows.append(
+                {
+                    "seed": int(seed),
+                    "model_type": model_type,
+                    "embedding_name": embedding_name,
+                    "strategy": "single",
+                    "accuracy": float(metrics.get("accuracy", 0.0)),
+                    "precision": float(metrics.get("precision", 0.0)),
+                    "recall": float(metrics.get("recall", 0.0)),
+                    "f1": float(item.get("test_f1", metrics.get("f1", 0.0))),
+                    "TP": float(confusion.get("TP", 0.0)),
+                    "TN": float(confusion.get("TN", 0.0)),
+                    "FP": float(confusion.get("FP", 0.0)),
+                    "FN": float(confusion.get("FN", 0.0)),
+                    "rank": float("nan"),
+                }
+            )
+
+        return rows
+
+    @staticmethod
+    def _sanitize_filename_token(value: str) -> str:
+        text = str(value).strip()
+        if text == "":
+            return "unknown"
+        sanitized = "".join(char if (char.isalnum() or char in {"-", "_"}) else "_" for char in text)
+        sanitized = sanitized.strip("_")
+        return sanitized or "unknown"
+
+    @staticmethod
+    def _export_model_prediction_files(
+        seed: int,
+        predictions_csv: Path | None,
+        model_predictions_export_dir: Path,
+    ) -> None:
+        if predictions_csv is None or not predictions_csv.exists():
+            return
+
+        seed_dir = model_predictions_export_dir / f"seed_{int(seed)}"
+        seed_dir.mkdir(parents=True, exist_ok=True)
+
+        grouped_rows: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        fieldnames: list[str] = []
+        with predictions_csv.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = list(reader.fieldnames or [])
+            for row in reader:
+                model_type = str(row.get("model_type", "")).strip()
+                embedding_name = str(row.get("embedding_name", "")).strip()
+                if not model_type or not embedding_name:
+                    continue
+                grouped_rows.setdefault((model_type, embedding_name), []).append(row)
+
+        if not fieldnames:
+            fieldnames = [
+                "accession",
+                "true_label",
+                "predicted_label",
+                "prediction_probability",
+                "model_type",
+                "embedding_name",
+                "seed",
+            ]
+
+        for (model_type, embedding_name), rows in grouped_rows.items():
+            model_token = Pipeline._sanitize_filename_token(model_type)
+            embedding_token = Pipeline._sanitize_filename_token(embedding_name)
+            out_path = seed_dir / f"{model_token}__{embedding_token}.csv"
+            with out_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+
+    @staticmethod
+    def _export_ensemble_prediction_files(
+        seed: int,
+        ensemble_prediction_seed_dir: Path | None,
+        ensemble_predictions_export_dir: Path,
+    ) -> None:
+        if ensemble_prediction_seed_dir is None or not ensemble_prediction_seed_dir.exists():
+            return
+
+        seed_dir = ensemble_predictions_export_dir / f"seed_{int(seed)}"
+        seed_dir.mkdir(parents=True, exist_ok=True)
+
+        for csv_path in sorted([path for path in ensemble_prediction_seed_dir.glob("*.csv") if path.is_file()]):
+            target = seed_dir / csv_path.name
+            target.write_bytes(csv_path.read_bytes())
+
+    @staticmethod
+    def _ensemble_metrics_from_prediction_files(
+        ensemble_prediction_seed_dir: Path | None,
+    ) -> dict[str, dict[str, float]]:
+        if ensemble_prediction_seed_dir is None or not ensemble_prediction_seed_dir.exists():
+            return {}
+
+        strategy_pairs: dict[str, list[tuple[Any, Any]]] = {}
+        for csv_path in sorted([path for path in ensemble_prediction_seed_dir.glob("*.csv") if path.is_file()]):
+            with csv_path.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                for row in reader:
+                    strategy = str(row.get("strategy", "")).strip()
+                    if not strategy:
+                        strategy = csv_path.stem
+                    true_label = row.get("true_label")
+                    predicted_label = row.get("predicted_label")
+                    if true_label is None or predicted_label is None:
+                        continue
+                    strategy_pairs.setdefault(strategy, []).append((true_label, predicted_label))
+
+        metrics_by_strategy: dict[str, dict[str, float]] = {}
+        for strategy, pairs in strategy_pairs.items():
+            metrics = Pipeline._binary_metrics_and_confusion_from_pairs(pairs)
+            if metrics:
+                metrics_by_strategy[strategy] = metrics
+
+        return metrics_by_strategy
+
+    @staticmethod
+    def _ensemble_rows_from_global_execution_summary(
+        seed: int,
+        summary: Mapping[str, Any],
+        ensemble_metrics: Mapping[str, Mapping[str, float]] | None = None,
+    ) -> list[dict[str, Any]]:
+        raw_ensembles = summary.get("ensembles", [])
+        if not isinstance(raw_ensembles, list):
+            return []
+
+        metric_lookup = dict(ensemble_metrics or {})
+        rows: list[dict[str, Any]] = []
+        for item in raw_ensembles:
+            if not isinstance(item, Mapping):
+                continue
+
+            strategy = str(item.get("variant", "")).strip()
+            if not strategy:
+                continue
+
+            test_metrics = item.get("test_metrics", {})
+            metrics = dict(test_metrics) if isinstance(test_metrics, Mapping) else {}
+            pred_metrics = dict(metric_lookup.get(strategy, {})) if strategy in metric_lookup else {}
+
+            rows.append(
+                {
+                    "seed": int(seed),
+                    "model_type": "Ensemble",
+                    "embedding_name": "all",
+                    "strategy": strategy,
+                    "accuracy": float(pred_metrics.get("accuracy", metrics.get("accuracy", 0.0))),
+                    "precision": float(pred_metrics.get("precision", metrics.get("precision", 0.0))),
+                    "recall": float(pred_metrics.get("recall", metrics.get("recall", 0.0))),
+                    "f1": float(pred_metrics.get("f1", item.get("test_f1", metrics.get("f1", 0.0)))),
+                    "TP": float(pred_metrics.get("TP", item.get("TP", 0.0))),
+                    "TN": float(pred_metrics.get("TN", item.get("TN", 0.0))),
+                    "FP": float(pred_metrics.get("FP", item.get("FP", 0.0))),
+                    "FN": float(pred_metrics.get("FN", item.get("FN", 0.0))),
+                    "rank": float("nan"),
+                }
+            )
+
+        return rows
+
+    @staticmethod
+    def _assign_rankings_per_seed(seed_rows: list[dict[str, Any]]) -> None:
+        grouped: dict[int, list[dict[str, Any]]] = {}
+        for row in seed_rows:
+            grouped.setdefault(int(row.get("seed", -1)), []).append(row)
+
+        for rows in grouped.values():
+            ranked = sorted(rows, key=Pipeline._rank_sort_key)
+            previous_f1: float | None = None
+            current_rank: int = 0
+            for idx, row in enumerate(ranked, start=1):
+                f1_value = Pipeline._safe_float(row.get("f1", float("nan")))
+                if not np.isfinite(f1_value):
+                    row["rank"] = float("nan")
+                    continue
+
+                if previous_f1 is None or not np.isclose(f1_value, previous_f1, rtol=0.0, atol=1e-12):
+                    current_rank = int(idx)
+                    previous_f1 = float(f1_value)
+
+                row["rank"] = float(current_rank)
+
+    @staticmethod
+    def _rank_sort_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
+        f1_value = Pipeline._safe_float(row.get("f1", float("nan")))
+        has_finite = np.isfinite(f1_value)
+        return (
+            0 if has_finite else 1,
+            -f1_value if has_finite else float("inf"),
+            str(row.get("model_type", "")),
+            str(row.get("embedding_name", "")),
+            str(row.get("strategy", "")),
+        )
+
+    @staticmethod
+    def _aggregate_global_seed_rows(seed_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        for row in seed_rows:
+            key = (
+                str(row.get("model_type", "")),
+                str(row.get("embedding_name", "")),
+                str(row.get("strategy", "")),
+            )
+            grouped.setdefault(key, []).append(row)
+
+        aggregated: list[dict[str, Any]] = []
+        for (model_type, embedding_name, strategy), rows in grouped.items():
+            accuracy_values = np.asarray([Pipeline._safe_float(row.get("accuracy")) for row in rows], dtype=float)
+            precision_values = np.asarray([Pipeline._safe_float(row.get("precision")) for row in rows], dtype=float)
+            recall_values = np.asarray([Pipeline._safe_float(row.get("recall")) for row in rows], dtype=float)
+            f1_values = np.asarray([Pipeline._safe_float(row.get("f1")) for row in rows], dtype=float)
+            tp_values = np.asarray([Pipeline._safe_float(row.get("TP")) for row in rows], dtype=float)
+            tn_values = np.asarray([Pipeline._safe_float(row.get("TN")) for row in rows], dtype=float)
+            fp_values = np.asarray([Pipeline._safe_float(row.get("FP")) for row in rows], dtype=float)
+            fn_values = np.asarray([Pipeline._safe_float(row.get("FN")) for row in rows], dtype=float)
+            rank_values = np.asarray([Pipeline._safe_float(row.get("rank")) for row in rows], dtype=float)
+
+            rank_sum = float(np.nansum(rank_values)) if np.isfinite(rank_values).any() else float("nan")
+            aggregated.append(
+                {
+                    "model_type": model_type,
+                    "embedding_name": embedding_name,
+                    "strategy": strategy,
+                    "mean_accuracy": _safe_nanmean(accuracy_values),
+                    "std_accuracy": _safe_nanstd(accuracy_values),
+                    "mean_precision": _safe_nanmean(precision_values),
+                    "std_precision": _safe_nanstd(precision_values),
+                    "mean_recall": _safe_nanmean(recall_values),
+                    "std_recall": _safe_nanstd(recall_values),
+                    "mean_f1": _safe_nanmean(f1_values),
+                    "std_f1": _safe_nanstd(f1_values),
+                    "TP_mean": _safe_nanmean(tp_values),
+                    "TN_mean": _safe_nanmean(tn_values),
+                    "FP_mean": _safe_nanmean(fp_values),
+                    "FN_mean": _safe_nanmean(fn_values),
+                    "rank_mean": _safe_nanmean(rank_values),
+                    "rank_sum": rank_sum,
+                    "num_seeds": len({int(row.get("seed", -1)) for row in rows}),
+                }
+            )
+
+        return sorted(
+            aggregated,
+            key=lambda row: (
+                1 if not np.isfinite(Pipeline._safe_float(row.get("rank_sum"))) else 0,
+                Pipeline._safe_float(row.get("rank_sum"))
+                if np.isfinite(Pipeline._safe_float(row.get("rank_sum")))
+                else float("inf"),
+                Pipeline._safe_float(row.get("rank_mean"))
+                if np.isfinite(Pipeline._safe_float(row.get("rank_mean")))
+                else float("inf"),
+                -Pipeline._safe_float(row.get("mean_f1"))
+                if np.isfinite(Pipeline._safe_float(row.get("mean_f1")))
+                else float("inf"),
+                str(row.get("model_type", "")),
+                str(row.get("embedding_name", "")),
+                str(row.get("strategy", "")),
+            ),
+        )
+
+    def _log_global_combination_coverage(
+        self,
+        expected_model_combinations: set[tuple[str, str]],
+        model_seed_rows: list[dict[str, Any]],
+        expected_ensemble_strategies: Sequence[str],
+        ensemble_seed_rows: list[dict[str, Any]],
+        expected_seeds: Sequence[int],
+    ) -> None:
+        seed_set = {int(seed) for seed in expected_seeds}
+
+        model_expected = {
+            (int(seed), str(model_type), str(embedding_name))
+            for seed in seed_set
+            for model_type, embedding_name in sorted(expected_model_combinations)
+        }
+        model_observed = {
+            (
+                int(row.get("seed", -1)),
+                str(row.get("model_type", "")),
+                str(row.get("embedding_name", "")),
+            )
+            for row in model_seed_rows
+            if str(row.get("strategy", "")) == "single"
+        }
+        model_missing = sorted(model_expected - model_observed)
+        self.logger.info(
+            "Global benchmark model coverage expected=%d observed=%d missing=%d",
+            len(model_expected),
+            len(model_observed),
+            len(model_missing),
+        )
+        if model_missing:
+            preview = ", ".join(
+                [f"seed={seed}:{model_type}::{embedding_name}" for seed, model_type, embedding_name in model_missing[:10]]
+            )
+            self.logger.warning("Missing model benchmark combinations: %s", preview)
+
+        strategy_set = {str(strategy).strip() for strategy in expected_ensemble_strategies if str(strategy).strip()}
+        ensemble_expected = {(int(seed), strategy) for seed in seed_set for strategy in sorted(strategy_set)}
+        ensemble_observed = {
+            (int(row.get("seed", -1)), str(row.get("strategy", "")))
+            for row in ensemble_seed_rows
+            if str(row.get("model_type", "")) == "Ensemble"
+        }
+        ensemble_missing = sorted(ensemble_expected - ensemble_observed)
+        self.logger.info(
+            "Global benchmark ensemble coverage expected=%d observed=%d missing=%d",
+            len(ensemble_expected),
+            len(ensemble_observed),
+            len(ensemble_missing),
+        )
+        if ensemble_missing:
+            preview = ", ".join([f"seed={seed}:{strategy}" for seed, strategy in ensemble_missing[:10]])
+            self.logger.warning("Missing ensemble benchmark combinations: %s", preview)
+
+    @staticmethod
+    def _default_global_aggregated_row(
+        *,
+        model_type: str,
+        embedding_name: str,
+        strategy: str,
+    ) -> dict[str, Any]:
+        return {
+            "model_type": str(model_type),
+            "embedding_name": str(embedding_name),
+            "strategy": str(strategy),
+            "mean_accuracy": float("nan"),
+            "std_accuracy": float("nan"),
+            "mean_precision": float("nan"),
+            "std_precision": float("nan"),
+            "mean_recall": float("nan"),
+            "std_recall": float("nan"),
+            "mean_f1": float("nan"),
+            "std_f1": float("nan"),
+            "TP_mean": 0.0,
+            "TN_mean": 0.0,
+            "FP_mean": 0.0,
+            "FN_mean": 0.0,
+            "rank_mean": float("nan"),
+            "rank_sum": float("nan"),
+            "num_seeds": 0,
+        }
+
+    @staticmethod
+    def _append_missing_expected_model_rows(
+        aggregated_rows: list[dict[str, Any]],
+        expected_model_combinations: set[tuple[str, str]],
+    ) -> list[dict[str, Any]]:
+        rows = list(aggregated_rows)
+        existing = {
+            (
+                str(row.get("model_type", "")),
+                str(row.get("embedding_name", "")),
+                str(row.get("strategy", "")),
+            )
+            for row in rows
+        }
+
+        for model_type, embedding_name in sorted(expected_model_combinations):
+            key = (str(model_type), str(embedding_name), "single")
+            if key in existing:
+                continue
+            rows.append(
+                Pipeline._default_global_aggregated_row(
+                    model_type=str(model_type),
+                    embedding_name=str(embedding_name),
+                    strategy="single",
+                )
+            )
+
+        return sorted(
+            rows,
+            key=lambda row: (
+                1 if not np.isfinite(Pipeline._safe_float(row.get("rank_sum"))) else 0,
+                Pipeline._safe_float(row.get("rank_sum"))
+                if np.isfinite(Pipeline._safe_float(row.get("rank_sum")))
+                else float("inf"),
+                Pipeline._safe_float(row.get("rank_mean"))
+                if np.isfinite(Pipeline._safe_float(row.get("rank_mean")))
+                else float("inf"),
+                -Pipeline._safe_float(row.get("mean_f1"))
+                if np.isfinite(Pipeline._safe_float(row.get("mean_f1")))
+                else float("inf"),
+                str(row.get("model_type", "")),
+                str(row.get("embedding_name", "")),
+                str(row.get("strategy", "")),
+            ),
+        )
+
+    @staticmethod
+    def _append_missing_expected_ensemble_rows(
+        aggregated_rows: list[dict[str, Any]],
+        expected_ensemble_strategies: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        rows = list(aggregated_rows)
+        existing = {
+            (
+                str(row.get("model_type", "")),
+                str(row.get("embedding_name", "")),
+                str(row.get("strategy", "")),
+            )
+            for row in rows
+        }
+
+        for strategy in sorted({str(item).strip() for item in expected_ensemble_strategies if str(item).strip()}):
+            key = ("Ensemble", "all", strategy)
+            if key in existing:
+                continue
+            rows.append(
+                Pipeline._default_global_aggregated_row(
+                    model_type="Ensemble",
+                    embedding_name="all",
+                    strategy=strategy,
+                )
+            )
+
+        return sorted(
+            rows,
+            key=lambda row: (
+                1 if not np.isfinite(Pipeline._safe_float(row.get("rank_sum"))) else 0,
+                Pipeline._safe_float(row.get("rank_sum"))
+                if np.isfinite(Pipeline._safe_float(row.get("rank_sum")))
+                else float("inf"),
+                Pipeline._safe_float(row.get("rank_mean"))
+                if np.isfinite(Pipeline._safe_float(row.get("rank_mean")))
+                else float("inf"),
+                -Pipeline._safe_float(row.get("mean_f1"))
+                if np.isfinite(Pipeline._safe_float(row.get("mean_f1")))
+                else float("inf"),
+                str(row.get("model_type", "")),
+                str(row.get("embedding_name", "")),
+                str(row.get("strategy", "")),
+            ),
+        )
+
+    @staticmethod
+    def _write_global_benchmark_ranking_table_csv(
+        path: Path,
+        model_rows: list[dict[str, Any]],
+        ensemble_rows: list[dict[str, Any]],
+    ) -> None:
+        fieldnames = [
+            "scope",
+            "model_type",
+            "embedding_name",
+            "strategy",
+            "mean_f1",
+            "rank_mean",
+            "rank_sum",
+            "num_seeds",
+        ]
+
+        ranking_rows: list[dict[str, Any]] = []
+        for row in model_rows:
+            ranking_rows.append(
+                {
+                    "scope": "model_embedding",
+                    "model_type": row.get("model_type"),
+                    "embedding_name": row.get("embedding_name"),
+                    "strategy": row.get("strategy"),
+                    "mean_f1": row.get("mean_f1"),
+                    "rank_mean": row.get("rank_mean"),
+                    "rank_sum": row.get("rank_sum"),
+                    "num_seeds": row.get("num_seeds"),
+                }
+            )
+        for row in ensemble_rows:
+            ranking_rows.append(
+                {
+                    "scope": "ensemble_strategy",
+                    "model_type": row.get("model_type"),
+                    "embedding_name": row.get("embedding_name"),
+                    "strategy": row.get("strategy"),
+                    "mean_f1": row.get("mean_f1"),
+                    "rank_mean": row.get("rank_mean"),
+                    "rank_sum": row.get("rank_sum"),
+                    "num_seeds": row.get("num_seeds"),
+                }
+            )
+
+        ranking_rows = sorted(
+            ranking_rows,
+            key=lambda row: (
+                str(row.get("scope", "")),
+                1 if not np.isfinite(Pipeline._safe_float(row.get("rank_sum"))) else 0,
+                Pipeline._safe_float(row.get("rank_sum"))
+                if np.isfinite(Pipeline._safe_float(row.get("rank_sum")))
+                else float("inf"),
+                Pipeline._safe_float(row.get("rank_mean"))
+                if np.isfinite(Pipeline._safe_float(row.get("rank_mean")))
+                else float("inf"),
+                -Pipeline._safe_float(row.get("mean_f1"))
+                if np.isfinite(Pipeline._safe_float(row.get("mean_f1")))
+                else float("inf"),
+                str(row.get("model_type", "")),
+                str(row.get("embedding_name", "")),
+                str(row.get("strategy", "")),
+            ),
+        )
+
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in ranking_rows:
+                writer.writerow({name: row.get(name) for name in fieldnames})
+
+    @staticmethod
+    def _write_global_benchmark_table_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+        fieldnames = [
+            "model_type",
+            "embedding_name",
+            "strategy",
+            "mean_accuracy",
+            "std_accuracy",
+            "mean_precision",
+            "std_precision",
+            "mean_recall",
+            "std_recall",
+            "mean_f1",
+            "std_f1",
+            "TP_mean",
+            "TN_mean",
+            "FP_mean",
+            "FN_mean",
+            "rank_mean",
+            "rank_sum",
+            "num_seeds",
+        ]
+
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({name: row.get(name) for name in fieldnames})
+
+    def _run_global_benchmark_statistical_analysis(
+        self,
+        global_benchmark_dir: Path,
+        model_seed_rows: list[dict[str, Any]],
+        ensemble_seed_rows: list[dict[str, Any]],
+    ) -> None:
+        alpha = 0.05
+        statistics_dir = global_benchmark_dir / "statistics"
+        statistics_dir.mkdir(parents=True, exist_ok=True)
+
+        scope_records = {
+            "model_embedding": self._global_statistics_records_from_seed_rows(
+                model_seed_rows,
+                scope="model_embedding",
+            ),
+            "ensemble_strategy": self._global_statistics_records_from_seed_rows(
+                ensemble_seed_rows,
+                scope="ensemble_strategy",
+            ),
+        }
+
+        friedman_rows: list[dict[str, Any]] = []
+        ranking_rows: list[dict[str, Any]] = []
+        nemenyi_rows: list[dict[str, Any]] = []
+        diagram_payloads: list[dict[str, Any]] = []
+
+        for scope_name, records in scope_records.items():
+            score_matrix = build_score_matrix(
+                records,
+                run_key="seed",
+                model_key="model_config",
+                score_key="f1",
+                drop_incomplete=True,
+            )
+
+            avg_ranks = np.asarray([], dtype=float)
+            if score_matrix.num_models > 0 and score_matrix.num_runs > 0:
+                rank_matrix = compute_rank_matrix(score_matrix.values, higher_is_better=True)
+                avg_ranks = compute_average_ranks(rank_matrix)
+
+            ranked_configs = sorted(
+                zip(score_matrix.model_ids, avg_ranks),
+                key=lambda item: float(item[1]) if np.isfinite(float(item[1])) else float("inf"),
+            )
+            for model_config, avg_rank in ranked_configs:
+                ranking_rows.append(
+                    {
+                        "scope": scope_name,
+                        "model_config": str(model_config),
+                        "avg_rank": float(avg_rank),
+                        "num_runs": int(score_matrix.num_runs),
+                        "num_models": int(score_matrix.num_models),
+                    }
+                )
+
+            friedman_result_row = {
+                "scope": scope_name,
+                "statistic": float("nan"),
+                "p_value": float("nan"),
+                "num_models": int(score_matrix.num_models),
+                "num_runs": int(score_matrix.num_runs),
+                "alpha": float(alpha),
+                "significant": False,
+                "posthoc_executed": False,
+                "status": "insufficient_data",
+            }
+
+            if score_matrix.num_models < 2 or score_matrix.num_runs < 2:
+                friedman_rows.append(friedman_result_row)
+                continue
+
+            if score_matrix.num_models < 3:
+                friedman_result_row["status"] = "insufficient_models_for_friedman"
+                friedman_rows.append(friedman_result_row)
+                continue
+
+            try:
+                friedman_result = run_friedman_test(score_matrix.values, alpha=alpha)
+            except ValueError as exc:
+                friedman_result_row["status"] = f"failed: {exc}"
+                friedman_rows.append(friedman_result_row)
+                continue
+
+            friedman_result_row.update(
+                {
+                    "statistic": float(friedman_result.get("statistic", float("nan"))),
+                    "p_value": float(friedman_result.get("p_value", float("nan"))),
+                    "num_models": int(friedman_result.get("num_models", score_matrix.num_models)),
+                    "num_runs": int(friedman_result.get("num_runs", score_matrix.num_runs)),
+                    "significant": bool(friedman_result.get("significant", False)),
+                    "status": "ok",
+                }
+            )
+
+            if friedman_result_row["significant"]:
+                nemenyi_result = run_nemenyi_posthoc(
+                    avg_ranks=avg_ranks,
+                    model_labels=score_matrix.model_ids,
+                    num_runs=score_matrix.num_runs,
+                    alpha=alpha,
+                )
+                friedman_result_row["posthoc_executed"] = True
+
+                critical_difference = float(nemenyi_result.get("critical_difference", float("nan")))
+                for comparison in nemenyi_result.get("comparisons", []):
+                    if not isinstance(comparison, Mapping):
+                        continue
+                    nemenyi_rows.append(
+                        {
+                            "scope": scope_name,
+                            "model_a": str(comparison.get("model_a", "")),
+                            "model_b": str(comparison.get("model_b", "")),
+                            "p_value": float(comparison.get("p_value", float("nan"))),
+                            "significant": bool(comparison.get("significant", False)),
+                            "rank_diff": float(comparison.get("rank_diff", float("nan"))),
+                            "critical_difference": float(
+                                comparison.get("critical_difference", critical_difference)
+                            ),
+                        }
+                    )
+
+                if np.isfinite(critical_difference) and ranked_configs:
+                    diagram_payloads.append(
+                        {
+                            "scope": scope_name,
+                            "critical_difference": critical_difference,
+                            "rankings": [
+                                {
+                                    "model_config": str(model_config),
+                                    "avg_rank": float(avg_rank),
+                                }
+                                for model_config, avg_rank in ranked_configs
+                            ],
+                        }
+                    )
+
+            friedman_rows.append(friedman_result_row)
+
+        friedman_json = statistics_dir / "friedman_results.json"
+        with friedman_json.open("w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "generated_at": datetime.utcnow().isoformat() + "Z",
+                    "alpha": float(alpha),
+                    "tests": friedman_rows,
+                },
+                handle,
+                indent=2,
+            )
+
+        rankings_csv = statistics_dir / "model_rankings.csv"
+        self._write_global_benchmark_rankings_csv(rankings_csv, ranking_rows)
+
+        nemenyi_csv = statistics_dir / "nemenyi_results.csv"
+        self._write_global_benchmark_nemenyi_csv(nemenyi_csv, nemenyi_rows)
+
+        self.logger.info("Saved Friedman test artifact: %s", friedman_json)
+        self.logger.info("Saved model ranking artifact: %s", rankings_csv)
+        self.logger.info("Saved Nemenyi post-hoc artifact: %s", nemenyi_csv)
+
+        if diagram_payloads:
+            cd_diagram = statistics_dir / "critical_difference_diagram.png"
+            if self._write_critical_difference_diagram(cd_diagram, diagram_payloads):
+                self.logger.info("Saved critical difference diagram artifact: %s", cd_diagram)
+
+    @staticmethod
+    def _global_statistics_records_from_seed_rows(
+        seed_rows: list[dict[str, Any]],
+        scope: str,
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for row in seed_rows:
+            try:
+                seed = int(row.get("seed"))
+            except Exception:
+                continue
+
+            f1_value = Pipeline._safe_float(row.get("f1"))
+            if not np.isfinite(f1_value):
+                continue
+
+            model_config = ""
+            if scope == "model_embedding":
+                model_type = str(row.get("model_type", "")).strip()
+                embedding_name = str(row.get("embedding_name", "")).strip()
+                if not model_type or not embedding_name:
+                    continue
+                model_config = f"{embedding_name} + {model_type}"
+            elif scope == "ensemble_strategy":
+                strategy = str(row.get("strategy", "")).strip()
+                if not strategy:
+                    continue
+                model_config = strategy
+
+            if model_config == "":
+                continue
+
+            records.append(
+                {
+                    "seed": int(seed),
+                    "model_config": model_config,
+                    "f1": float(f1_value),
+                }
+            )
+
+        return sorted(records, key=lambda item: (int(item.get("seed", -1)), str(item.get("model_config", ""))))
+
+    @staticmethod
+    def _write_global_benchmark_rankings_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+        fieldnames = [
+            "scope",
+            "model_config",
+            "avg_rank",
+            "num_runs",
+            "num_models",
+        ]
+
+        ordered_rows = sorted(
+            rows,
+            key=lambda row: (
+                str(row.get("scope", "")),
+                Pipeline._safe_float(row.get("avg_rank"))
+                if np.isfinite(Pipeline._safe_float(row.get("avg_rank")))
+                else float("inf"),
+                str(row.get("model_config", "")),
+            ),
+        )
+
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in ordered_rows:
+                writer.writerow({name: row.get(name) for name in fieldnames})
+
+    @staticmethod
+    def _write_global_benchmark_nemenyi_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+        fieldnames = [
+            "scope",
+            "model_a",
+            "model_b",
+            "p_value",
+            "significant",
+            "rank_diff",
+            "critical_difference",
+        ]
+
+        ordered_rows = sorted(
+            rows,
+            key=lambda row: (
+                str(row.get("scope", "")),
+                Pipeline._safe_float(row.get("p_value"))
+                if np.isfinite(Pipeline._safe_float(row.get("p_value")))
+                else float("inf"),
+                str(row.get("model_a", "")),
+                str(row.get("model_b", "")),
+            ),
+        )
+
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in ordered_rows:
+                writer.writerow({name: row.get(name) for name in fieldnames})
+
+    @staticmethod
+    def _write_critical_difference_diagram(path: Path, payloads: list[dict[str, Any]]) -> bool:
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            return False
+
+        if not payloads:
+            return False
+
+        figure, axes = plt.subplots(
+            len(payloads),
+            1,
+            figsize=(12, 3.5 * len(payloads)),
+            squeeze=False,
+        )
+
+        for index, payload in enumerate(payloads):
+            axis = axes[index, 0]
+            rankings = payload.get("rankings", [])
+            if not isinstance(rankings, list) or not rankings:
+                axis.set_visible(False)
+                continue
+
+            avg_ranks = [float(item.get("avg_rank", float("nan"))) for item in rankings]
+            labels = [str(item.get("model_config", "")) for item in rankings]
+            finite_ranks = [value for value in avg_ranks if np.isfinite(value)]
+            if not finite_ranks:
+                axis.set_visible(False)
+                continue
+
+            y_values = np.zeros(len(avg_ranks), dtype=float)
+            axis.scatter(avg_ranks, y_values, color="black", s=20)
+
+            for avg_rank, label in zip(avg_ranks, labels):
+                axis.text(
+                    avg_rank,
+                    0.02,
+                    label,
+                    fontsize=8,
+                    rotation=45,
+                    ha="right",
+                    va="bottom",
+                )
+
+            cd = float(payload.get("critical_difference", float("nan")))
+            if np.isfinite(cd):
+                cd_start = min(finite_ranks)
+                cd_end = cd_start + cd
+                axis.plot([cd_start, cd_end], [0.12, 0.12], color="black", linewidth=2)
+                axis.plot([cd_start, cd_start], [0.10, 0.14], color="black", linewidth=2)
+                axis.plot([cd_end, cd_end], [0.10, 0.14], color="black", linewidth=2)
+                axis.text(
+                    (cd_start + cd_end) / 2.0,
+                    0.15,
+                    f"CD={cd:.3f}",
+                    fontsize=9,
+                    ha="center",
+                    va="bottom",
+                )
+
+            x_max = max(finite_ranks)
+            if np.isfinite(cd):
+                x_max += cd
+            axis.set_xlim(0.5, max(2.0, x_max + 0.5))
+            axis.set_title(str(payload.get("scope", "")))
+            axis.set_xlabel("Average rank (lower is better)")
+            axis.set_yticks([])
+            axis.grid(True, axis="x", linestyle="--", alpha=0.4)
+
+        figure.tight_layout()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(path, dpi=300, bbox_inches="tight")
+        plt.close(figure)
+        return True
+
+    @staticmethod
+    def _prediction_confusions_by_model(predictions_csv: Path | None) -> dict[tuple[str, str], dict[str, float]]:
+        if predictions_csv is None or not predictions_csv.exists():
+            return {}
+
+        grouped_pairs: dict[tuple[str, str], list[tuple[Any, Any]]] = {}
+        with predictions_csv.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                model_type = str(row.get("model_type", "")).strip()
+                embedding_name = str(row.get("embedding_name", "")).strip()
+                true_label = row.get("true_label")
+                predicted_label = row.get("predicted_label")
+
+                if not model_type or not embedding_name:
+                    continue
+                if true_label is None or predicted_label is None:
+                    continue
+
+                grouped_pairs.setdefault((model_type, embedding_name), []).append((true_label, predicted_label))
+
+        confusion_by_model: dict[tuple[str, str], dict[str, float]] = {}
+        for key, pairs in grouped_pairs.items():
+            confusion = Pipeline._binary_confusion_counts_from_pairs(pairs)
+            if confusion:
+                confusion_by_model[key] = confusion
+
+        return confusion_by_model
+
+    @staticmethod
+    def _coerce_binary_label(value: Any) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, (bool, np.bool_)):
+            return int(value)
+        if isinstance(value, (int, np.integer)):
+            ivalue = int(value)
+            return ivalue if ivalue in (0, 1) else None
+        if isinstance(value, (float, np.floating)):
+            if np.isfinite(value):
+                ivalue = int(value)
+                if float(ivalue) == float(value) and ivalue in (0, 1):
+                    return ivalue
+            return None
+
+        text = str(value).strip().lower()
+        if text in {"1", "true", "t", "yes", "y", "positive", "pos", "nmf"}:
+            return 1
+        if text in {"0", "false", "f", "no", "n", "negative", "neg", "mf"}:
+            return 0
+
+        try:
+            parsed = float(text)
+        except Exception:
+            return None
+
+        if np.isfinite(parsed) and float(int(parsed)) == float(parsed):
+            ivalue = int(parsed)
+            if ivalue in (0, 1):
+                return ivalue
+        return None
+
+    @staticmethod
+    def _binary_metrics_and_confusion_from_pairs(pairs: list[tuple[Any, Any]]) -> dict[str, float]:
+        if not pairs:
+            return {}
+
+        y_true: list[int] = []
+        y_pred: list[int] = []
+        for true_value, predicted_value in pairs:
+            true_label = Pipeline._coerce_binary_label(true_value)
+            predicted_label = Pipeline._coerce_binary_label(predicted_value)
+            if true_label is None or predicted_label is None:
+                continue
+            y_true.append(int(true_label))
+            y_pred.append(int(predicted_label))
+
+        if not y_true or not y_pred:
+            return {}
+
+        y_true_arr = np.asarray(y_true, dtype=int)
+        y_pred_arr = np.asarray(y_pred, dtype=int)
+        matrix = confusion_matrix(y_true_arr, y_pred_arr, labels=[0, 1])
+        if np.asarray(matrix).shape != (2, 2):
+            return {}
+
+        return {
+            "accuracy": float(accuracy_score(y_true_arr, y_pred_arr)),
+            "precision": float(precision_score(y_true_arr, y_pred_arr, zero_division=0)),
+            "recall": float(recall_score(y_true_arr, y_pred_arr, zero_division=0)),
+            "f1": float(f1_score(y_true_arr, y_pred_arr, zero_division=0)),
+            "TN": float(matrix[0][0]),
+            "FP": float(matrix[0][1]),
+            "FN": float(matrix[1][0]),
+            "TP": float(matrix[1][1]),
+        }
+
+    @staticmethod
+    def _binary_confusion_counts_from_pairs(pairs: list[tuple[Any, Any]]) -> dict[str, float]:
+        metrics = Pipeline._binary_metrics_and_confusion_from_pairs(pairs)
+        if not metrics:
+            return {}
+        return {
+            "TN": float(metrics.get("TN", 0.0)),
+            "FP": float(metrics.get("FP", 0.0)),
+            "FN": float(metrics.get("FN", 0.0)),
+            "TP": float(metrics.get("TP", 0.0)),
+        }
+
+    @staticmethod
+    def _coerce_label_token(value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (bool, np.bool_)):
+            return int(value)
+        if isinstance(value, (int, np.integer)):
+            return int(value)
+        if isinstance(value, (float, np.floating)):
+            if np.isfinite(value) and float(value).is_integer():
+                return int(value)
+            return value
+
+        text = str(value).strip()
+        if text == "":
+            return None
+        lower = text.lower()
+        if lower in {"true", "t", "yes", "y"}:
+            return 1
+        if lower in {"false", "f", "no", "n"}:
+            return 0
+
+        try:
+            parsed = float(text)
+        except Exception:
+            return text
+
+        if np.isfinite(parsed) and float(parsed).is_integer():
+            return int(parsed)
+        return text
+
+    @staticmethod
+    def _binary_confusion_counts_from_matrix(matrix: Any) -> dict[str, float]:
+        try:
+            arr = np.asarray(matrix, dtype=float)
+        except Exception:
+            return {}
+
+        if arr.shape != (2, 2):
+            return {}
+
+        return {
+            "TN": float(arr[0, 0]),
+            "FP": float(arr[0, 1]),
+            "FN": float(arr[1, 0]),
+            "TP": float(arr[1, 1]),
+        }
+
+    def _resolve_seed_used(self, pipeline_conf: dict[str, Any], default: int = 42) -> int:
+        runtime_seed = self.runtime_context.get("seed_used")
+        if runtime_seed is not None:
+            return int(runtime_seed)
+
+        experiment_conf = (
+            pipeline_conf.get("experiment", {})
+            if isinstance(pipeline_conf.get("experiment", {}), Mapping)
+            else {}
+        )
+        if experiment_conf.get("main_seed") is not None:
+            return int(experiment_conf.get("main_seed"))
+
+        return int(default)
 
     @staticmethod
     def _comparison_rows_from_seed_results(benchmark_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1189,9 +2931,20 @@ class Pipeline:
             {
                 "Category": row.get("category"),
                 "Variant": row.get("variant"),
+                "Validation Acc": float((row.get("validation_metrics") or {}).get("accuracy", float("nan"))),
+                "Validation Press": float((row.get("validation_metrics") or {}).get("precision", float("nan"))),
+                "Validation Rec": float((row.get("validation_metrics") or {}).get("recall", float("nan"))),
                 "Validation F1": float(row.get("validation_f1", float("nan"))),
+                "Test Acc": float((row.get("test_metrics") or {}).get("accuracy", float("nan"))),
+                "Test Press": float((row.get("test_metrics") or {}).get("precision", float("nan"))),
+                "Test Rec": float((row.get("test_metrics") or {}).get("recall", float("nan"))),
                 "Test F1": float(row.get("test_f1", float("nan"))),
+                "Zero-Shot Acc": float((row.get("zero_shot_metrics") or {}).get("accuracy", float("nan"))),
+                "Zero-Shot Press": float((row.get("zero_shot_metrics") or {}).get("precision", float("nan"))),
+                "Zero-Shot Rec": float((row.get("zero_shot_metrics") or {}).get("recall", float("nan"))),
+                "Zero-Shot F1": float(row.get("zero_shot_f1", float("nan"))),
                 "Delta vs Best Single (Test)": float(row.get("delta_vs_best_single_test", float("nan"))),
+                "Delta vs Best Single (Zero-Shot)": float(row.get("delta_vs_best_single_zero_shot", float("nan"))),
                 "Num Models": int(row.get("num_models", 0)),
                 "Weighting Strategy": row.get("weighting_strategy", ""),
             }
@@ -1222,9 +2975,50 @@ class Pipeline:
 
         aggregated: list[dict[str, Any]] = []
         for (ablation, variant), rows in grouped.items():
+            val_acc_values = np.asarray(
+                [float((row.get("validation_metrics") or {}).get("accuracy", float("nan"))) for row in rows],
+                dtype=float,
+            )
+            val_precision_values = np.asarray(
+                [float((row.get("validation_metrics") or {}).get("precision", float("nan"))) for row in rows],
+                dtype=float,
+            )
+            val_recall_values = np.asarray(
+                [float((row.get("validation_metrics") or {}).get("recall", float("nan"))) for row in rows],
+                dtype=float,
+            )
             val_values = np.asarray([float(row.get("validation_f1", float("nan"))) for row in rows], dtype=float)
+            test_acc_values = np.asarray(
+                [float((row.get("test_metrics") or {}).get("accuracy", float("nan"))) for row in rows],
+                dtype=float,
+            )
+            test_precision_values = np.asarray(
+                [float((row.get("test_metrics") or {}).get("precision", float("nan"))) for row in rows],
+                dtype=float,
+            )
+            test_recall_values = np.asarray(
+                [float((row.get("test_metrics") or {}).get("recall", float("nan"))) for row in rows],
+                dtype=float,
+            )
             test_values = np.asarray([float(row.get("test_f1", float("nan"))) for row in rows], dtype=float)
+            zero_acc_values = np.asarray(
+                [float((row.get("zero_shot_metrics") or {}).get("accuracy", float("nan"))) for row in rows],
+                dtype=float,
+            )
+            zero_precision_values = np.asarray(
+                [float((row.get("zero_shot_metrics") or {}).get("precision", float("nan"))) for row in rows],
+                dtype=float,
+            )
+            zero_recall_values = np.asarray(
+                [float((row.get("zero_shot_metrics") or {}).get("recall", float("nan"))) for row in rows],
+                dtype=float,
+            )
+            zero_f1_values = np.asarray([float(row.get("zero_shot_f1", float("nan"))) for row in rows], dtype=float)
             delta_values = np.asarray([float(row.get("delta_vs_best_single_test", float("nan"))) for row in rows], dtype=float)
+            zero_delta_values = np.asarray(
+                [float(row.get("delta_vs_best_single_zero_shot", float("nan"))) for row in rows],
+                dtype=float,
+            )
             gap_values = np.asarray([float(row.get("generalization_gap", float("nan"))) for row in rows], dtype=float)
             base = rows[0]
             aggregated.append(
@@ -1232,13 +3026,25 @@ class Pipeline:
                     "ablation": ablation,
                     "category": base.get("category"),
                     "variant": variant,
-                    "mean_validation_f1": float(np.nanmean(val_values)),
-                    "std_validation_f1": float(np.nanstd(val_values)),
-                    "mean_test_f1": float(np.nanmean(test_values)),
-                    "std_test_f1": float(np.nanstd(test_values)),
-                    "mean_delta_vs_best": float(np.nanmean(delta_values)),
-                    "std_delta_vs_best": float(np.nanstd(delta_values)),
-                    "mean_generalization_gap": float(np.nanmean(gap_values)),
+                    "mean_validation_acc": _safe_nanmean(val_acc_values),
+                    "mean_validation_precision": _safe_nanmean(val_precision_values),
+                    "mean_validation_recall": _safe_nanmean(val_recall_values),
+                    "mean_validation_f1": _safe_nanmean(val_values),
+                    "std_validation_f1": _safe_nanstd(val_values),
+                    "mean_test_acc": _safe_nanmean(test_acc_values),
+                    "mean_test_precision": _safe_nanmean(test_precision_values),
+                    "mean_test_recall": _safe_nanmean(test_recall_values),
+                    "mean_test_f1": _safe_nanmean(test_values),
+                    "std_test_f1": _safe_nanstd(test_values),
+                    "mean_zero_shot_acc": _safe_nanmean(zero_acc_values),
+                    "mean_zero_shot_precision": _safe_nanmean(zero_precision_values),
+                    "mean_zero_shot_recall": _safe_nanmean(zero_recall_values),
+                    "mean_zero_shot_f1": _safe_nanmean(zero_f1_values),
+                    "std_zero_shot_f1": _safe_nanstd(zero_f1_values),
+                    "mean_delta_vs_best": _safe_nanmean(delta_values),
+                    "std_delta_vs_best": _safe_nanstd(delta_values),
+                    "mean_delta_vs_best_zero_shot": _safe_nanmean(zero_delta_values),
+                    "mean_generalization_gap": _safe_nanmean(gap_values),
                     "num_models": int(base.get("num_models", 0)),
                     "weighting_strategy": base.get("weighting_strategy", ""),
                     "successful_runs": len(rows),
@@ -1252,9 +3058,20 @@ class Pipeline:
             {
                 "Category": row.get("category"),
                 "Variant": row.get("variant"),
+                "Validation Acc": row.get("mean_validation_acc"),
+                "Validation Press": row.get("mean_validation_precision"),
+                "Validation Rec": row.get("mean_validation_recall"),
                 "Validation F1": row.get("mean_validation_f1"),
+                "Test Acc": row.get("mean_test_acc"),
+                "Test Press": row.get("mean_test_precision"),
+                "Test Rec": row.get("mean_test_recall"),
                 "Test F1": row.get("mean_test_f1"),
+                "Zero-Shot Acc": row.get("mean_zero_shot_acc"),
+                "Zero-Shot Press": row.get("mean_zero_shot_precision"),
+                "Zero-Shot Rec": row.get("mean_zero_shot_recall"),
+                "Zero-Shot F1": row.get("mean_zero_shot_f1"),
                 "Delta vs Best Single (Test)": row.get("mean_delta_vs_best"),
+                "Delta vs Best Single (Zero-Shot)": row.get("mean_delta_vs_best_zero_shot"),
                 "Num Models": row.get("num_models"),
                 "Weighting Strategy": row.get("weighting_strategy"),
             }
@@ -1270,6 +3087,8 @@ class Pipeline:
             "Std Val F1",
             "Mean Test F1",
             "Std Test F1",
+            "Mean Zero-Shot F1",
+            "Std Zero-Shot F1",
             "Mean Delta vs Best",
             "Std Delta vs Best",
             "Num Models",
@@ -1287,6 +3106,8 @@ class Pipeline:
                         "Std Val F1": row.get("std_validation_f1"),
                         "Mean Test F1": row.get("mean_test_f1"),
                         "Std Test F1": row.get("std_test_f1"),
+                        "Mean Zero-Shot F1": row.get("mean_zero_shot_f1"),
+                        "Std Zero-Shot F1": row.get("std_zero_shot_f1"),
                         "Mean Delta vs Best": row.get("mean_delta_vs_best"),
                         "Std Delta vs Best": row.get("std_delta_vs_best"),
                         "Num Models": row.get("num_models"),
@@ -1304,6 +3125,8 @@ class Pipeline:
             "Std Val F1",
             "Mean Test F1",
             "Std Test F1",
+            "Mean Zero-Shot F1",
+            "Std Zero-Shot F1",
             "Mean Delta vs Best",
             "Std Delta vs Best",
             "Num Models",
@@ -1323,6 +3146,8 @@ class Pipeline:
                         "Std Val F1": row.get("std_validation_f1"),
                         "Mean Test F1": row.get("mean_test_f1"),
                         "Std Test F1": row.get("std_test_f1"),
+                        "Mean Zero-Shot F1": row.get("mean_zero_shot_f1"),
+                        "Std Zero-Shot F1": row.get("std_zero_shot_f1"),
                         "Mean Delta vs Best": row.get("mean_delta_vs_best"),
                         "Std Delta vs Best": row.get("std_delta_vs_best"),
                         "Num Models": row.get("num_models"),
@@ -1501,8 +3326,10 @@ class Pipeline:
         y_val: np.ndarray,
         x_test_map: Mapping[str, np.ndarray],
         y_test: np.ndarray,
+        x_zero_map: Mapping[str, np.ndarray],
+        y_zero: np.ndarray,
         include_diagnostics: bool = False,
-    ) -> tuple[float, float, dict[str, Any] | None]:
+    ) -> tuple[dict[str, float], dict[str, float], dict[str, float] | None, dict[str, Any] | None]:
         probs_val = ProbabilityAdapter.to_canonical(
             raw_output=np.asarray(artifact.model.predict_proba(x_val_map)),
             problem_type=artifact.problem_type,
@@ -1515,7 +3342,7 @@ class Pipeline:
             threshold_config=artifact.threshold_policy,
         )
         val_labels = self._coerce_predictions_to_label_space(np.asarray(preds_val), classes=artifact.classes)
-        val_f1 = _benchmark_f1_score(
+        val_metrics = _benchmark_metrics(
             problem_type=artifact.problem_type,
             y_true=np.asarray(y_val),
             y_pred=np.asarray(val_labels),
@@ -1534,19 +3361,40 @@ class Pipeline:
             threshold_config=artifact.threshold_policy,
         )
         test_labels = self._coerce_predictions_to_label_space(np.asarray(preds_test), classes=artifact.classes)
-        test_f1 = _benchmark_f1_score(
+        test_metrics = _benchmark_metrics(
             problem_type=artifact.problem_type,
             y_true=np.asarray(y_test),
             y_pred=np.asarray(test_labels),
             classes=artifact.classes,
         )
 
+        zero_metrics: dict[str, float] | None = None
+        if np.asarray(y_zero).shape[0] > 0:
+            probs_zero = ProbabilityAdapter.to_canonical(
+                raw_output=np.asarray(artifact.model.predict_proba(x_zero_map)),
+                problem_type=artifact.problem_type,
+                classes=artifact.classes,
+                context=f"benchmark/{artifact.classifier_name}/{artifact.embedding_name}/zero_shot",
+            )
+            preds_zero = decide(
+                probs=probs_zero,
+                problem_type=artifact.problem_type,
+                threshold_config=artifact.threshold_policy,
+            )
+            zero_labels = self._coerce_predictions_to_label_space(np.asarray(preds_zero), classes=artifact.classes)
+            zero_metrics = _benchmark_metrics(
+                problem_type=artifact.problem_type,
+                y_true=np.asarray(y_zero),
+                y_pred=np.asarray(zero_labels),
+                classes=artifact.classes,
+            )
+
         if not include_diagnostics:
-            return val_f1, test_f1, None
+            return val_metrics, test_metrics, zero_metrics, None
 
         diagnostics: dict[str, Any] = {
             "n_val": int(np.asarray(y_val).shape[0]),
-            "macro_f1": val_f1,
+            "macro_f1": float(val_metrics.get("f1", float("nan"))),
             "micro_f1": float("nan"),
             "per_class_f1": {},
             "class_distribution": {},
@@ -1588,7 +3436,7 @@ class Pipeline:
             except Exception:
                 diagnostics["confusion_matrix"] = None
 
-        return val_f1, test_f1, diagnostics
+        return val_metrics, test_metrics, zero_metrics, diagnostics
 
     def _run_benchmark_ensemble_variant(
         self,
@@ -1598,8 +3446,13 @@ class Pipeline:
         y_val: np.ndarray,
         x_test_map: Mapping[str, np.ndarray],
         y_test: np.ndarray,
+        x_zero_map: Mapping[str, np.ndarray],
+        y_zero: np.ndarray,
         selected_payloads: list[dict[str, Any]],
         benchmark_models_dir: Path,
+        seed: int,
+        test_ids: Sequence[Any],
+        benchmark_predictions_seed_dir: Path,
     ) -> dict[str, Any]:
         variant_name = str(spec.get("variant", "ensemble_variant"))
         mode = EnsembleMode(spec.get("mode", EnsembleMode.GLOBAL_SOFT))
@@ -1638,6 +3491,7 @@ class Pipeline:
         service.fit_with_validation(x_val_map, np.asarray(y_val))
         val_output = service.predict(x_val_map)
         test_output = service.predict(x_test_map)
+        raw_test_labels = np.asarray(test_output.get("labels"), dtype=object)
 
         val_labels = self._coerce_predictions_to_label_space(
             np.asarray(val_output.get("labels")),
@@ -1650,18 +3504,48 @@ class Pipeline:
         ensemble_problem_type = str(test_output.get("metadata", {}).get("problem_type", "binary"))
         ensemble_classes = np.asarray(test_output.get("metadata", {}).get("classes", []), dtype=object).tolist()
 
-        val_f1 = _benchmark_f1_score(
+        val_metrics = _benchmark_metrics(
             problem_type=ensemble_problem_type,
             y_true=np.asarray(y_val),
             y_pred=np.asarray(val_labels),
             classes=ensemble_classes,
         )
-        test_f1 = _benchmark_f1_score(
+        test_metrics = _benchmark_metrics(
             problem_type=ensemble_problem_type,
             y_true=np.asarray(y_test),
             y_pred=np.asarray(test_labels),
             classes=ensemble_classes,
         )
+
+        prediction_pairs = list(zip(np.asarray(y_test, dtype=object).tolist(), np.asarray(test_labels, dtype=object).tolist()))
+        confusion_metrics = self._binary_metrics_and_confusion_from_pairs(prediction_pairs)
+
+        test_probabilities = np.asarray(test_output.get("probabilities", np.asarray([])), dtype=float)
+        self._write_benchmark_ensemble_predictions_csv(
+            path=benchmark_predictions_seed_dir / f"{self._sanitize_filename_token(variant_name)}.csv",
+            strategy=variant_name,
+            seed=int(seed),
+            test_ids=test_ids,
+            y_true=np.asarray(y_test),
+            predicted_labels=np.asarray(test_labels),
+            raw_predictions=np.asarray(raw_test_labels),
+            probabilities=np.asarray(test_probabilities),
+            classes=ensemble_classes,
+        )
+
+        zero_metrics: dict[str, float] | None = None
+        if np.asarray(y_zero).shape[0] > 0:
+            zero_output = service.predict(x_zero_map)
+            zero_labels = self._coerce_predictions_to_label_space(
+                np.asarray(zero_output.get("labels")),
+                classes=np.asarray(zero_output.get("metadata", {}).get("classes", []), dtype=object).tolist(),
+            )
+            zero_metrics = _benchmark_metrics(
+                problem_type=str(zero_output.get("metadata", {}).get("problem_type", ensemble_problem_type)),
+                y_true=np.asarray(y_zero),
+                y_pred=np.asarray(zero_labels),
+                classes=np.asarray(zero_output.get("metadata", {}).get("classes", []), dtype=object).tolist(),
+            )
         weights = np.asarray(test_output.get("metadata", {}).get("ensemble", {}).get("weights", []), dtype=np.float64)
 
         summary_rows = self._build_ensemble_summary_rows(
@@ -1684,17 +3568,83 @@ class Pipeline:
         return {
             "category": "Ensemble",
             "variant": variant_name,
-            "validation_f1": val_f1,
-            "test_f1": test_f1,
+            "validation_metrics": val_metrics,
+            "test_metrics": test_metrics,
+            "zero_shot_metrics": zero_metrics,
+            "validation_f1": float(val_metrics.get("f1", float("nan"))),
+            "test_f1": float(test_metrics.get("f1", float("nan"))),
+            "zero_shot_f1": float(zero_metrics.get("f1", float("nan"))) if zero_metrics else float("nan"),
             "num_models": len(model_artifacts),
             "weighting_strategy": strategy.value,
             "mode": mode.value,
             "models_used": [f"{artifact.classifier_name}::{artifact.embedding_name}" for artifact in model_artifacts],
             "weights": weights.tolist() if weights.size else [],
+            "TP": float(confusion_metrics.get("TP", 0.0)),
+            "TN": float(confusion_metrics.get("TN", 0.0)),
+            "FP": float(confusion_metrics.get("FP", 0.0)),
+            "FN": float(confusion_metrics.get("FN", 0.0)),
             "model_validation_scores": {
                 str(row.get("model")): float(row.get("validation_score", float("nan"))) for row in summary_rows
             },
         }
+
+    def _write_benchmark_ensemble_predictions_csv(
+        self,
+        path: Path,
+        strategy: str,
+        seed: int,
+        test_ids: Sequence[Any],
+        y_true: np.ndarray,
+        predicted_labels: np.ndarray,
+        raw_predictions: np.ndarray,
+        probabilities: np.ndarray,
+        classes: Sequence[Any],
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        y_true_arr = np.asarray(y_true, dtype=object)
+        pred_arr = np.asarray(predicted_labels, dtype=object)
+        raw_arr = np.asarray(raw_predictions, dtype=object)
+        probs_arr = np.asarray(probabilities, dtype=float)
+
+        row_count = int(
+            min(
+                len(test_ids),
+                y_true_arr.shape[0] if y_true_arr.ndim > 0 else 0,
+                pred_arr.shape[0] if pred_arr.ndim > 0 else 0,
+                raw_arr.shape[0] if raw_arr.ndim > 0 else 0,
+                probs_arr.shape[0] if probs_arr.ndim > 0 else 0,
+            )
+        )
+
+        fieldnames = [
+            "accession",
+            "true_label",
+            "predicted_label",
+            "prediction_probability",
+            "strategy",
+            "seed",
+        ]
+
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for index in range(row_count):
+                writer.writerow(
+                    {
+                        "accession": str(test_ids[index]),
+                        "true_label": self._serialize_label(y_true_arr[index]),
+                        "predicted_label": self._serialize_label(pred_arr[index]),
+                        "prediction_probability": self._resolve_prediction_probability(
+                            probs_row=np.asarray(probs_arr[index]),
+                            predicted_label=pred_arr[index],
+                            classes=classes,
+                            raw_prediction=raw_arr[index],
+                        ),
+                        "strategy": str(strategy),
+                        "seed": int(seed),
+                    }
+                )
 
     @staticmethod
     def _coerce_predictions_to_label_space(predictions: np.ndarray, classes: list[Any]) -> np.ndarray:
@@ -1716,9 +3666,20 @@ class Pipeline:
         fieldnames = [
             "Category",
             "Variant",
+            "Validation Acc",
+            "Validation Press",
+            "Validation Rec",
             "Validation F1",
+            "Test Acc",
+            "Test Press",
+            "Test Rec",
             "Test F1",
+            "Zero-Shot Acc",
+            "Zero-Shot Press",
+            "Zero-Shot Rec",
+            "Zero-Shot F1",
             "Delta vs Best Single (Test)",
+            "Delta vs Best Single (Zero-Shot)",
             "Num Models",
             "Weighting Strategy",
         ]
@@ -1734,15 +3695,17 @@ class Pipeline:
 
         category_w = max(len("Category"), *(len(str(row.get("Category", ""))) for row in rows))
         variant_w = max(len("Variant"), *(len(str(row.get("Variant", ""))) for row in rows))
-        val_w = len("Validation F1")
+        val_w = len("Val F1")
         test_w = len("Test F1")
-        delta_w = len("Delta")
+        zero_w = len("Zero F1")
+        delta_w = len("ΔTest")
+        delta_zero_w = len("ΔZero")
         num_w = len("Num")
         weight_w = max(len("Weighting Strategy"), *(len(str(row.get("Weighting Strategy", ""))) for row in rows))
 
         lines = [
-            f"{'Category':<{category_w}}  {'Variant':<{variant_w}}  {'Validation F1':>{val_w}}  {'Test F1':>{test_w}}  {'Delta':>{delta_w}}  {'Num':>{num_w}}  {'Weighting Strategy':<{weight_w}}",
-            f"{'-' * category_w}  {'-' * variant_w}  {'-' * val_w}  {'-' * test_w}  {'-' * delta_w}  {'-' * num_w}  {'-' * weight_w}",
+            f"{'Category':<{category_w}}  {'Variant':<{variant_w}}  {'Val F1':>{val_w}}  {'Test F1':>{test_w}}  {'Zero F1':>{zero_w}}  {'ΔTest':>{delta_w}}  {'ΔZero':>{delta_zero_w}}  {'Num':>{num_w}}  {'Weighting Strategy':<{weight_w}}",
+            f"{'-' * category_w}  {'-' * variant_w}  {'-' * val_w}  {'-' * test_w}  {'-' * zero_w}  {'-' * delta_w}  {'-' * delta_zero_w}  {'-' * num_w}  {'-' * weight_w}",
         ]
         for row in rows:
             lines.append(
@@ -1750,7 +3713,9 @@ class Pipeline:
                 f"{str(row.get('Variant', '')):<{variant_w}}  "
                 f"{float(row.get('Validation F1', float('nan'))):>{val_w}.4f}  "
                 f"{float(row.get('Test F1', float('nan'))):>{test_w}.4f}  "
+                f"{float(row.get('Zero-Shot F1', float('nan'))):>{zero_w}.4f}  "
                 f"{float(row.get('Delta vs Best Single (Test)', float('nan'))):>{delta_w}.4f}  "
+                f"{float(row.get('Delta vs Best Single (Zero-Shot)', float('nan'))):>{delta_zero_w}.4f}  "
                 f"{int(row.get('Num Models', 0)):>{num_w}d}  "
                 f"{str(row.get('Weighting Strategy', '')):<{weight_w}}"
             )
@@ -2002,6 +3967,11 @@ class Pipeline:
             "ensemble_config": dict(ensemble_conf),
             "weights": list(ensemble_meta.get("weights", [])),
             "models_used": summary_rows,
+            "seed_used": (
+                int(self.runtime_context.get("seed_used"))
+                if self.runtime_context.get("seed_used") is not None
+                else None
+            ),
             "problem_type": metadata.get("problem_type"),
             "classes": metadata.get("classes"),
             "num_classes": metadata.get("num_classes"),
@@ -2037,7 +4007,9 @@ class Pipeline:
         embeddings_config_path = embeddings_step_conf.get("config_path", "config/embeddings.yaml")
         embeddings_conf = self._load_yaml(embeddings_config_path)
         training_global_conf = self._load_training_config(pipeline_conf)
-        reporting_conf = self._build_reporting_config(training_global_conf)
+        reporting_conf = self._with_runtime_reporting_overrides(
+            self._build_reporting_config(training_global_conf)
+        )
         path_layout = self._ensure_pec_data_layout(reporting_conf)
 
         latest_run_dir = self._get_latest_sweep_run(path_layout["sweep"])
@@ -2175,6 +4147,7 @@ class Pipeline:
             "sweep": self.run_sweep_step,
             "ensemble": self.run_ensemble_step,
             "benchmark": self.run_benchmark_step,
+            "global_benchmark": self.run_global_benchmark_step,
             "evaluate": self.run_evaluate_step,
         }
 
@@ -2207,7 +4180,12 @@ class Pipeline:
         db_conf = load_db_config(db_conf_path)
         engine = create_engine_from_config(db_conf)
 
-        ordered_accessions = dataset_bundle.train_ids + dataset_bundle.val_ids + dataset_bundle.test_ids
+        ordered_accessions = (
+            dataset_bundle.train_ids
+            + dataset_bundle.val_ids
+            + dataset_bundle.test_ids
+            + list(getattr(dataset_bundle, "zero_shot_ids", []))
+        )
         service = EmbeddingService(
             embeddings_config=embeddings_conf,
             engine=engine,
@@ -2285,54 +4263,136 @@ class Pipeline:
             writer.writeheader()
             writer.writerow(row)
 
-    @staticmethod
-    def _write_full_sweep_results_csv(path: Path, trial_results: list[dict[str, Any]]) -> None:
+    @classmethod
+    def _write_full_sweep_results_csv(
+        cls,
+        path: Path,
+        trial_results: list[dict[str, Any]],
+        *,
+        final_test_rows: list[dict[str, Any]] | None = None,
+        seed_used: int | None = None,
+    ) -> None:
         fieldnames = [
             "model_type",
             "embedding_name",
-            "trial_index",
-            "val_accuracy",
-            "val_precision",
-            "val_recall",
-            "val_f1",
-            "val_roc_auc",
-            "val_pr_auc",
+            "validation_accuracy",
+            "validation_precision",
+            "validation_recall",
+            "validation_f1",
             "test_accuracy",
             "test_precision",
             "test_recall",
             "test_f1",
+            "test_roc_auc",
+            "test_pr_auc",
+            "TP",
+            "TN",
+            "FP",
+            "FN",
+            "seed_used",
         ]
+
+        rows_to_write: list[dict[str, Any]] = []
+
+        for result in trial_results:
+            validation_metrics = result.get("validation_metrics", {})
+            test_metrics = result.get("test_metrics")
+            if not isinstance(validation_metrics, Mapping):
+                validation_metrics = {}
+            if not isinstance(test_metrics, Mapping):
+                test_metrics = {}
+
+            confusion = cls._resolve_binary_confusion_counts(
+                test_metrics if isinstance(test_metrics, Mapping) and test_metrics else validation_metrics
+            )
+            row_seed = result.get("seed_used", seed_used)
+            rows_to_write.append(
+                {
+                    "model_type": result.get("model_type", ""),
+                    "embedding_name": result.get("embedding_name", ""),
+                    "validation_accuracy": validation_metrics.get("accuracy", ""),
+                    "validation_precision": validation_metrics.get("precision", ""),
+                    "validation_recall": validation_metrics.get("recall", ""),
+                    "validation_f1": validation_metrics.get("f1", validation_metrics.get("macro_f1", "")),
+                    "test_accuracy": test_metrics.get("accuracy", ""),
+                    "test_precision": test_metrics.get("precision", ""),
+                    "test_recall": test_metrics.get("recall", ""),
+                    "test_f1": test_metrics.get("f1", test_metrics.get("macro_f1", "")),
+                    "test_roc_auc": test_metrics.get("roc_auc", ""),
+                    "test_pr_auc": test_metrics.get("pr_auc", ""),
+                    "TP": confusion["TP"],
+                    "TN": confusion["TN"],
+                    "FP": confusion["FP"],
+                    "FN": confusion["FN"],
+                    "seed_used": "" if row_seed is None else int(row_seed),
+                }
+            )
+
+        for result in final_test_rows or []:
+            validation_metrics = result.get("validation_metrics", {})
+            test_metrics = result.get("test_metrics")
+            if not isinstance(validation_metrics, Mapping):
+                validation_metrics = {}
+            if not isinstance(test_metrics, Mapping):
+                test_metrics = {}
+
+            confusion = cls._resolve_binary_confusion_counts(
+                test_metrics if isinstance(test_metrics, Mapping) and test_metrics else validation_metrics
+            )
+            row_seed = result.get("seed_used", seed_used)
+            rows_to_write.append(
+                {
+                    "model_type": result.get("model_type", ""),
+                    "embedding_name": result.get("embedding_name", ""),
+                    "validation_accuracy": validation_metrics.get("accuracy", ""),
+                    "validation_precision": validation_metrics.get("precision", ""),
+                    "validation_recall": validation_metrics.get("recall", ""),
+                    "validation_f1": validation_metrics.get("f1", validation_metrics.get("macro_f1", "")),
+                    "test_accuracy": test_metrics.get("accuracy", ""),
+                    "test_precision": test_metrics.get("precision", ""),
+                    "test_recall": test_metrics.get("recall", ""),
+                    "test_f1": test_metrics.get("f1", test_metrics.get("macro_f1", "")),
+                    "test_roc_auc": test_metrics.get("roc_auc", ""),
+                    "test_pr_auc": test_metrics.get("pr_auc", ""),
+                    "TP": confusion["TP"],
+                    "TN": confusion["TN"],
+                    "FP": confusion["FP"],
+                    "FN": confusion["FN"],
+                    "seed_used": "" if row_seed is None else int(row_seed),
+                }
+            )
 
         with path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
+            writer.writerows(rows_to_write)
 
-            for result in trial_results:
-                validation_metrics = result.get("validation_metrics", {})
-                test_metrics = result.get("test_metrics")
+    @staticmethod
+    def _resolve_binary_confusion_counts(metrics: Mapping[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(metrics, Mapping):
+            return {"TP": "", "TN": "", "FP": "", "FN": ""}
 
-                if not isinstance(validation_metrics, Mapping):
-                    validation_metrics = {}
-                if not isinstance(test_metrics, Mapping):
-                    test_metrics = {}
+        if all(key in metrics for key in ("tp", "tn", "fp", "fn")):
+            return {
+                "TP": metrics.get("tp", ""),
+                "TN": metrics.get("tn", ""),
+                "FP": metrics.get("fp", ""),
+                "FN": metrics.get("fn", ""),
+            }
 
-                writer.writerow(
-                    {
-                        "model_type": result.get("model_type", ""),
-                        "embedding_name": result.get("embedding_name", ""),
-                        "trial_index": result.get("trial_index", ""),
-                        "val_accuracy": validation_metrics.get("accuracy", ""),
-                        "val_precision": validation_metrics.get("precision", ""),
-                        "val_recall": validation_metrics.get("recall", ""),
-                        "val_f1": validation_metrics.get("f1", validation_metrics.get("macro_f1", "")),
-                        "val_roc_auc": validation_metrics.get("roc_auc", ""),
-                        "val_pr_auc": validation_metrics.get("pr_auc", ""),
-                        "test_accuracy": test_metrics.get("accuracy", ""),
-                        "test_precision": test_metrics.get("precision", ""),
-                        "test_recall": test_metrics.get("recall", ""),
-                        "test_f1": test_metrics.get("f1", test_metrics.get("macro_f1", "")),
-                    }
-                )
+        matrix = metrics.get("confusion_matrix")
+        if isinstance(matrix, list) and len(matrix) == 2:
+            first_row = matrix[0] if isinstance(matrix[0], list) else None
+            second_row = matrix[1] if isinstance(matrix[1], list) else None
+            if first_row is not None and second_row is not None and len(first_row) == 2 and len(second_row) == 2:
+                return {
+                    "TP": second_row[1],
+                    "TN": first_row[0],
+                    "FP": first_row[1],
+                    "FN": second_row[0],
+                }
+
+        return {"TP": "", "TN": "", "FP": "", "FN": ""}
 
     @staticmethod
     def _load_training_config(pipeline_conf: dict[str, Any]) -> dict[str, Any]:
@@ -2604,31 +4664,60 @@ class Pipeline:
         fieldnames = [
             "model_type",
             "embedding_name",
+            "validation_accuracy",
+            "validation_precision",
+            "validation_recall",
+            "validation_f1",
             "test_accuracy",
             "test_precision",
             "test_recall",
             "test_f1",
             "test_roc_auc",
             "test_pr_auc",
+            "TP",
+            "TN",
+            "FP",
+            "FN",
+            "seed_used",
         ]
 
         with path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
             for row in rows:
+                validation_metrics = row.get("validation_metrics") if isinstance(row.get("validation_metrics"), Mapping) else {}
                 test_metrics = row.get("test_metrics") if isinstance(row.get("test_metrics"), Mapping) else {}
+                confusion = Pipeline._resolve_binary_confusion_counts(
+                    test_metrics if isinstance(test_metrics, Mapping) and test_metrics else validation_metrics
+                )
                 writer.writerow(
                     {
                         "model_type": row.get("model_type", ""),
                         "embedding_name": row.get("embedding_name", ""),
+                        "validation_accuracy": validation_metrics.get("accuracy", ""),
+                        "validation_precision": validation_metrics.get("precision", ""),
+                        "validation_recall": validation_metrics.get("recall", ""),
+                        "validation_f1": validation_metrics.get("f1", validation_metrics.get("macro_f1", "")),
                         "test_accuracy": test_metrics.get("accuracy", ""),
                         "test_precision": test_metrics.get("precision", ""),
                         "test_recall": test_metrics.get("recall", ""),
                         "test_f1": test_metrics.get("f1", test_metrics.get("macro_f1", "")),
                         "test_roc_auc": test_metrics.get("roc_auc", ""),
                         "test_pr_auc": test_metrics.get("pr_auc", ""),
+                        "TP": confusion["TP"],
+                        "TN": confusion["TN"],
+                        "FP": confusion["FP"],
+                        "FN": confusion["FN"],
+                        "seed_used": row.get("seed_used", ""),
                     }
                 )
+
+    def _with_runtime_reporting_overrides(self, reporting_conf: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(reporting_conf)
+        output_root_override = self.runtime_context.get("output_root_override")
+        if output_root_override:
+            merged["output_root"] = str(output_root_override)
+        return merged
 
     @staticmethod
     def _build_reporting_config(training_global_conf: dict[str, Any]) -> dict[str, Any]:
@@ -2751,7 +4840,15 @@ class Pipeline:
         with path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(
                 handle,
-                fieldnames=["embedding_name", "model_type", "validation_f1", "config", "artifact_path", "serializer"],
+                fieldnames=[
+                    "embedding_name",
+                    "model_type",
+                    "validation_f1",
+                    "config",
+                    "artifact_path",
+                    "serializer",
+                    "metadata_path",
+                ],
             )
             writer.writeheader()
             for row in rows:
@@ -2763,6 +4860,7 @@ class Pipeline:
                         "config": yaml.safe_dump(row.get("config", {}), sort_keys=True).strip(),
                         "artifact_path": row.get("artifact_path", ""),
                         "serializer": row.get("serializer", ""),
+                        "metadata_path": row.get("metadata_path", ""),
                     }
                 )
 
@@ -2776,10 +4874,12 @@ class Pipeline:
         selected_classifiers: list[str],
         run_started_at: str,
         run_duration_seconds: float,
+        seed_used: int | None = None,
     ) -> None:
         metadata = {
             "run_started_at": run_started_at,
             "run_duration_seconds": run_duration_seconds,
+            "seed_used": int(seed_used) if seed_used is not None else None,
             "selected_embeddings": selected_embeddings,
             "selected_classifiers": selected_classifiers,
             "runtime_filters": self.runtime_filters,
@@ -2814,6 +4914,131 @@ class Pipeline:
             except Exception:
                 versions[package] = None
         return versions
+
+    def _attach_model_artifacts_to_best_rows(
+        self,
+        best_classifier_per_embedding: list[dict[str, Any]],
+        final_test_rows: list[dict[str, Any]],
+    ) -> None:
+        model_lookup: dict[tuple[str, str], dict[str, Any]] = {
+            (str(row.get("model_type")), str(row.get("embedding_name"))): row
+            for row in final_test_rows
+        }
+
+        for row in best_classifier_per_embedding:
+            key = (str(row.get("model_type")), str(row.get("embedding_name")))
+            payload = model_lookup.get(key)
+            if payload is None:
+                continue
+
+            artifact = payload.get("model_artifact")
+            if isinstance(artifact, Mapping):
+                row["artifact_path"] = artifact.get("path", "")
+                row["serializer"] = artifact.get("serializer", "")
+                row["metadata_path"] = artifact.get("metadata_path", "")
+
+    def _write_seed_predictions_csv(
+        self,
+        path: Path,
+        dataset_bundle,
+        embedding_bundle: EmbeddingBundle,
+        final_test_rows: list[dict[str, Any]],
+        threshold_conf: dict[str, Any],
+        seed_used: int,
+    ) -> None:
+        fieldnames = [
+            "accession",
+            "true_label",
+            "predicted_label",
+            "prediction_probability",
+            "model_type",
+            "embedding_name",
+            "seed",
+        ]
+
+        rows: list[dict[str, Any]] = []
+        for payload in final_test_rows:
+            model = payload.get("model")
+            model_type = str(payload.get("model_type", ""))
+            embedding_name = str(payload.get("embedding_name", ""))
+            problem_type = str(payload.get("problem_type", "binary"))
+            classes = payload.get("classes")
+
+            if model is None:
+                continue
+            if embedding_name not in embedding_bundle.X_test:
+                continue
+
+            probs = ProbabilityAdapter.to_canonical(
+                raw_output=np.asarray(model.predict_proba(embedding_bundle.X_test[embedding_name])),
+                problem_type=problem_type,
+                classes=classes,
+                context=f"predictions/{model_type}/{embedding_name}/seed_{seed_used}",
+            )
+            preds = decide(
+                probs=probs,
+                problem_type=problem_type,
+                threshold_config={
+                    **dict(threshold_conf if isinstance(threshold_conf, Mapping) else {}),
+                    "classifier_name": model_type,
+                    "embedding_name": embedding_name,
+                },
+            )
+
+            pred_labels = np.asarray(preds, dtype=object)
+            if problem_type != "multilabel" and classes is not None:
+                class_array = np.asarray(classes, dtype=object)
+                if class_array.size > 0 and np.issubdtype(pred_labels.dtype, np.integer):
+                    min_index = int(np.min(pred_labels)) if pred_labels.size else 0
+                    max_index = int(np.max(pred_labels)) if pred_labels.size else -1
+                    if min_index >= 0 and max_index < int(class_array.size):
+                        pred_labels = class_array[np.asarray(pred_labels, dtype=int)]
+
+            for index, accession in enumerate(dataset_bundle.test_ids):
+                probability_value = self._resolve_prediction_probability(
+                    probs_row=np.asarray(probs[index]),
+                    predicted_label=pred_labels[index],
+                    classes=classes,
+                    raw_prediction=preds[index],
+                )
+                rows.append(
+                    {
+                        "accession": accession,
+                        "true_label": self._serialize_label(dataset_bundle.y_test[index]),
+                        "predicted_label": self._serialize_label(pred_labels[index]),
+                        "prediction_probability": probability_value,
+                        "model_type": model_type,
+                        "embedding_name": embedding_name,
+                        "seed": int(seed_used),
+                    }
+                )
+
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    @staticmethod
+    def _resolve_prediction_probability(
+        probs_row: np.ndarray,
+        predicted_label: Any,
+        classes: Any,
+        raw_prediction: Any,
+    ) -> float:
+        row = np.asarray(probs_row, dtype=float).reshape(-1)
+        if row.size == 0:
+            return float("nan")
+
+        class_list = np.asarray(classes, dtype=object).tolist() if classes is not None else []
+        if class_list and predicted_label in class_list:
+            return float(row[int(class_list.index(predicted_label))])
+
+        if isinstance(raw_prediction, (int, np.integer)):
+            raw_index = int(raw_prediction)
+            if 0 <= raw_index < row.size:
+                return float(row[raw_index])
+
+        return float(np.max(row))
 
     def _write_test_predictions_csv(
         self,

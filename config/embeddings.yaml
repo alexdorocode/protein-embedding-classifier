@@ -35,12 +35,12 @@ GOPE:
   enabled: True
   load_from: file
   file_info:
-    folder: /home/alexdoro/DATASETS/mf_proteins/GeOKG_mpf_embeddings
-    file_name_BP: geokg_embeddings_1000dim_mean_pool_P_go_terms.csv
-    file_name_MF: geokg_embeddings_1000dim_mean_pool_F_go_terms.csv
-    file_name_CC: geokg_embeddings_1000dim_mean_pool_C_go_terms.csv
-    accession_column: UniProt_ID
-    embedding_column: gope
+    folder: /home/alexdoro/DATASETS/mf_proteins/mfp_balanced
+    file_name_BP: bp_protein_embeddings_20260302_171152.csv
+    file_name_MF: mf_protein_embeddings_20260302_171152.csv
+    file_name_CC: cc_protein_embeddings_20260302_171152.csv
+    accession_column: uniprot_id
+    embedding_column: embedding
   models:
     GeOKG:
       enabled: True

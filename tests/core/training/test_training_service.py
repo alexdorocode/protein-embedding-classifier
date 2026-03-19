@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from sklearn.preprocessing import StandardScaler
 
 from protein_embedding_classifier.core.embedding_loading import EmbeddingBundle
@@ -321,3 +322,103 @@ def test_training_service_predict_proba_contract_with_normalization_modes():
         val_probs = payload["val_probs"]
         assert val_probs.shape[0] == _make_bundle().X_val["ESM3c"].shape[0]
         assert np.allclose(val_probs.sum(axis=1), np.ones(val_probs.shape[0]), atol=1e-6)
+
+
+def test_training_service_binary_string_labels_metrics_do_not_crash():
+    factory = DummyModelFactory()
+    service = TrainingService(model_factory=factory)
+
+    bundle = EmbeddingBundle(
+        X_train={"ESM3c": np.random.randn(12, 6).astype(np.float32)},
+        X_val={"ESM3c": np.random.randn(6, 6).astype(np.float32)},
+        X_test={"ESM3c": np.random.randn(6, 6).astype(np.float32)},
+        y_train=np.array(["MF", "NMF", "MF", "NMF", "MF", "NMF", "MF", "NMF", "MF", "NMF", "MF", "NMF"], dtype=object),
+        y_val=np.array(["MF", "NMF", "MF", "NMF", "MF", "NMF"], dtype=object),
+        y_test=np.array(["MF", "NMF", "MF", "NMF", "MF", "NMF"], dtype=object),
+    )
+
+    results = service.train(
+        embedding_bundle=bundle,
+        training_config={"model_types": ["LR"], "evaluate_test": True},
+    )
+
+    payload = results[("LR", "ESM3c")]
+    validation = payload["metrics"]["validation"]
+    assert "precision" in validation
+    assert "recall" in validation
+    assert "f1" in validation
+
+
+def test_training_service_xgb_encodes_string_labels(monkeypatch):
+    class _XgbLikeModel:
+        def fit(self, X, y):
+            y_arr = np.asarray(y)
+            assert np.issubdtype(y_arr.dtype, np.integer)
+            self.classes_ = np.array([0, 1], dtype=int)
+
+        def predict_proba(self, X):
+            n = np.asarray(X).shape[0]
+            probs = np.zeros((n, 2), dtype=np.float32)
+            probs[:, 0] = 0.4
+            probs[:, 1] = 0.6
+            return probs
+
+    class _Factory:
+        def create(self, model_type, params=None, input_size=None, output_size=None):
+            assert model_type == "XGB"
+            return _XgbLikeModel()
+
+    bundle = EmbeddingBundle(
+        X_train={"ESM3c": np.random.randn(12, 8).astype(np.float32)},
+        X_val={"ESM3c": np.random.randn(6, 8).astype(np.float32)},
+        X_test={"ESM3c": np.random.randn(6, 8).astype(np.float32)},
+        y_train=np.array(["MF", "NMF", "MF", "NMF", "MF", "NMF", "MF", "NMF", "MF", "NMF", "MF", "NMF"], dtype=object),
+        y_val=np.array(["MF", "NMF", "MF", "NMF", "MF", "NMF"], dtype=object),
+        y_test=np.array(["MF", "NMF", "MF", "NMF", "MF", "NMF"], dtype=object),
+    )
+
+    service = TrainingService(model_factory=_Factory())
+    result = service.train(
+        embedding_bundle=bundle,
+        training_config={"model_types": ["XGB"], "evaluate_test": True},
+    )
+
+    metrics = result[("XGB", "ESM3c")]["metrics"]
+    assert "f1" in metrics["validation"]
+    assert metrics["test"] is not None
+
+
+def test_torch_wrapper_batch_norm_avoids_singleton_batch(monkeypatch):
+    torch = pytest.importorskip("torch")
+
+    from protein_embedding_classifier.core.training.torch_wrapper import TorchTrainingWrapper
+
+    original_loader = torch.utils.data.DataLoader
+    captured: dict[str, object] = {}
+
+    def _recording_loader(*args, **kwargs):
+        captured["drop_last"] = kwargs.get("drop_last")
+        captured["batch_size"] = kwargs.get("batch_size")
+        return original_loader(*args, **kwargs)
+
+    monkeypatch.setattr(torch.utils.data, "DataLoader", _recording_loader)
+
+    model = TorchTrainingWrapper(
+        input_size=8,
+        output_size=2,
+        use_batch_norm=True,
+        batch_size=64,
+        num_epochs=1,
+        early_stopping_patience=1,
+        criterion_name="CrossEntropyLoss",
+    )
+
+    # 129 % 64 == 1 -> singleton final batch if drop_last=False
+    x_train = np.random.randn(129, 8).astype(np.float32)
+    y_train = np.array(["MF", "NMF"] * 64 + ["MF"], dtype=object)
+    x_val = np.random.randn(16, 8).astype(np.float32)
+    y_val = np.array(["MF", "NMF"] * 8, dtype=object)
+
+    model.fit(x_train, y_train, x_val, y_val)
+
+    assert captured.get("drop_last") is True

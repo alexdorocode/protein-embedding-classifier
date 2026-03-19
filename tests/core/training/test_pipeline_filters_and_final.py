@@ -1,3 +1,4 @@
+import csv
 from pathlib import Path
 
 import numpy as np
@@ -125,6 +126,102 @@ def test_final_training_writes_result_and_model(monkeypatch, tmp_path):
     assert csv_path.exists()
     content = csv_path.read_text(encoding="utf-8")
     assert "test_f1" in content
+
+
+def test_write_full_sweep_results_csv_contains_required_metric_columns(tmp_path):
+    output_path = tmp_path / "sweep_results_full.csv"
+
+    trial_rows = [
+        {
+            "model_type": "LR",
+            "embedding_name": "ESM2",
+            "validation_metrics": {
+                "accuracy": 0.82,
+                "precision": 0.81,
+                "recall": 0.83,
+                "f1": 0.82,
+            },
+            "test_metrics": {
+                "accuracy": 0.79,
+                "precision": 0.78,
+                "recall": 0.8,
+                "f1": 0.79,
+                "roc_auc": 0.86,
+                "pr_auc": 0.84,
+                "tp": 17,
+                "tn": 20,
+                "fp": 3,
+                "fn": 2,
+            },
+            "seed_used": 314,
+        }
+    ]
+    final_test_rows = [
+        {
+            "model_type": "SVM",
+            "embedding_name": "ESM2",
+            "validation_metrics": {
+                "accuracy": 0.8,
+                "precision": 0.79,
+                "recall": 0.81,
+                "f1": 0.8,
+            },
+            "test_metrics": {
+                "accuracy": 0.76,
+                "precision": 0.75,
+                "recall": 0.77,
+                "f1": 0.76,
+                "roc_auc": 0.83,
+                "pr_auc": 0.8,
+                "confusion_matrix": [[9, 1], [2, 6]],
+            },
+            "seed_used": 315,
+        }
+    ]
+
+    Pipeline._write_full_sweep_results_csv(
+        output_path,
+        trial_rows,
+        final_test_rows=final_test_rows,
+        seed_used=999,
+    )
+
+    with output_path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        required_columns = {
+            "model_type",
+            "embedding_name",
+            "validation_accuracy",
+            "validation_precision",
+            "validation_recall",
+            "validation_f1",
+            "test_accuracy",
+            "test_precision",
+            "test_recall",
+            "test_f1",
+            "test_roc_auc",
+            "test_pr_auc",
+            "TP",
+            "TN",
+            "FP",
+            "FN",
+            "seed_used",
+        }
+        assert required_columns.issubset(set(reader.fieldnames or []))
+        rows = list(reader)
+
+    assert len(rows) == 2
+    assert rows[0]["seed_used"] == "314"
+    assert rows[0]["TP"] == "17"
+    assert rows[0]["TN"] == "20"
+    assert rows[0]["FP"] == "3"
+    assert rows[0]["FN"] == "2"
+
+    assert rows[1]["seed_used"] == "315"
+    assert rows[1]["TP"] == "6"
+    assert rows[1]["TN"] == "9"
+    assert rows[1]["FP"] == "1"
+    assert rows[1]["FN"] == "2"
 
 
 def test_run_sweep_step_returns_cleanly_when_all_classifiers_skipped(monkeypatch, caplog, tmp_path):

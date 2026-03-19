@@ -56,11 +56,13 @@ class LabelLoader:
             for accession in accession_tokens:
                 exploded_rows.append((accession, label_value))
 
-        exploded_df = pd.DataFrame(exploded_rows, columns=[self.accession_column, self.label_column])
+        accession_key = "_accession"
+        label_key = "_label"
+        exploded_df = pd.DataFrame(exploded_rows, columns=[accession_key, label_key])
         if exploded_df.empty:
             return {}
 
-        grouped = exploded_df.groupby(self.accession_column)[self.label_column].apply(list)
+        grouped = exploded_df.groupby(accession_key)[label_key].apply(list)
         return {acc: self._normalize_grouped_labels(values) for acc, values in grouped.items()}
 
     @staticmethod

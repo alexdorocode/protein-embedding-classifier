@@ -60,17 +60,17 @@ dataset:
 
     # ----------------------------- FILE MODE ----------------------------------
     # Absolute or relative CSV path
-    file_path: /home/alexdoro/DATASETS/mf_proteins/predictor_dataset.csv
+    file_path: /home/alexdoro/DATASETS/mf_proteins/mfp_balanced/mfp_splited_dataset_with_go_metrics_20260302.csv
 
     # CSV column name that contains accession(s)
     # This loader supports values like:
     #   "P12345"
     #   "P12345;Q99999"
     #   "P12345,Q99999"
-    accession_column: "UniProt IDs"
+    accession_column: "uniprot_id"
 
     # CSV column name for class/label
-    label_column: "Class"
+    label_column: "data_class"
 
     # Folder where missing proteins report is created
     artifacts_dir: artifacts
@@ -100,12 +100,12 @@ dataset:
     # ------------------------ ACTIVE CONFIG ------------------------------------
     validation:
       # random | organism | csv
-      strategy: organism
+      strategy: csv
 
       # ---- random validation ----
-      # random:
-      #   val_size: 0.1
-      #   random_state: 42
+      random:
+        val_size: 0.1
+        random_state: 42
 
       # ---- organism validation ----
       organism:
@@ -113,15 +113,15 @@ dataset:
           - all_others
 
       # ---- csv validation ----
-      # csv:
-      #   csv_path: /path/to/split_definition.csv
-      #   accession_column: accession
-      #   split_column: split
-      #   validation_values: [val, validation]
+      csv:
+        csv_path: /home/alexdoro/DATASETS/mf_proteins/mfp_balanced/mfp_splited_dataset_with_go_metrics_20260302.csv 
+        accession_column: uniprot_id
+        split_column: data_split
+        validation_values: [val, validation]
 
     train_test:
       # random | cross_validation
-      strategy: random
+      strategy: cross_validation
 
       # Optional: only these organisms are subject to train/test split.
       # Remaining accessions stay in train after validation is removed.
@@ -141,6 +141,27 @@ dataset:
       random:
         test_size: 0.2
         random_state: 42
+
+    zero_shot:
+      # random | organism | csv
+      strategy: csv
+
+      # ---- random validation ----
+      random:
+        val_size: 0.1
+        random_state: 42
+
+      # ---- organism validation ----
+      organism:
+        val_organisms:
+          - all_others
+
+      # ---- csv validation ----
+      csv:
+        csv_path: /home/alexdoro/DATASETS/mf_proteins/mfp_balanced/mfp_splited_dataset_with_go_metrics_20260302.csv 
+        accession_column: uniprot_id
+        split_column: data_split
+        validation_values: [zs, zero_shot]
 
     # ------------------- LEGACY EXAMPLE (still supported) ---------------------
     # strategy: zero_shot_organism
@@ -165,6 +186,14 @@ dataset:
     # random_state: 42
 
 training_config_path: config/training/training_config.yaml
+
+experiment:
+  # Main reproducibility seed used as the base for global benchmarking.
+  main_seed: 42
+  global_benchmark:
+    # Number of deterministic executions for --step global_benchmark.
+    # CLI flag --n_seeds overrides this value.
+    n_seeds: 10
 
 ################################################################################
 # Optional top-level sections for future steps (embeddings/train/sweep/...)

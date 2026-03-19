@@ -322,17 +322,21 @@ class SweepService:
         columns = [
             "model_type",
             "embedding_name",
-            "trial_index",
-            "val_accuracy",
-            "val_precision",
-            "val_recall",
-            "val_f1",
-            "val_roc_auc",
-            "val_pr_auc",
+            "validation_accuracy",
+            "validation_precision",
+            "validation_recall",
+            "validation_f1",
             "test_accuracy",
             "test_precision",
             "test_recall",
             "test_f1",
+            "test_roc_auc",
+            "test_pr_auc",
+            "TP",
+            "TN",
+            "FP",
+            "FN",
+            "seed_used",
         ]
 
         with output_path.open("w", encoding="utf-8", newline="") as handle:
@@ -342,23 +346,57 @@ class SweepService:
             for result in trial_results:
                 validation = result.get("validation_metrics", {}) if isinstance(result.get("validation_metrics", {}), Mapping) else {}
                 test = result.get("test_metrics") if isinstance(result.get("test_metrics"), Mapping) else {}
+                confusion = self._resolve_binary_confusion_counts(
+                    test if isinstance(test, Mapping) and test else validation
+                )
 
                 row = {
                     "model_type": result.get("model_type", ""),
                     "embedding_name": result.get("embedding_name", ""),
-                    "trial_index": result.get("trial_index", ""),
-                    "val_accuracy": validation.get("accuracy", ""),
-                    "val_precision": validation.get("precision", ""),
-                    "val_recall": validation.get("recall", ""),
-                    "val_f1": validation.get("f1", validation.get("macro_f1", "")),
-                    "val_roc_auc": validation.get("roc_auc", ""),
-                    "val_pr_auc": validation.get("pr_auc", ""),
+                    "validation_accuracy": validation.get("accuracy", ""),
+                    "validation_precision": validation.get("precision", ""),
+                    "validation_recall": validation.get("recall", ""),
+                    "validation_f1": validation.get("f1", validation.get("macro_f1", "")),
                     "test_accuracy": test.get("accuracy", ""),
                     "test_precision": test.get("precision", ""),
                     "test_recall": test.get("recall", ""),
                     "test_f1": test.get("f1", test.get("macro_f1", "")),
+                    "test_roc_auc": test.get("roc_auc", ""),
+                    "test_pr_auc": test.get("pr_auc", ""),
+                    "TP": confusion["TP"],
+                    "TN": confusion["TN"],
+                    "FP": confusion["FP"],
+                    "FN": confusion["FN"],
+                    "seed_used": int(self.rng_seed),
                 }
                 writer.writerow(row)
+
+    @staticmethod
+    def _resolve_binary_confusion_counts(metrics: Mapping[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(metrics, Mapping):
+            return {"TP": "", "TN": "", "FP": "", "FN": ""}
+
+        if all(key in metrics for key in ("tp", "tn", "fp", "fn")):
+            return {
+                "TP": metrics.get("tp", ""),
+                "TN": metrics.get("tn", ""),
+                "FP": metrics.get("fp", ""),
+                "FN": metrics.get("fn", ""),
+            }
+
+        matrix = metrics.get("confusion_matrix")
+        if isinstance(matrix, list) and len(matrix) == 2:
+            first_row = matrix[0] if isinstance(matrix[0], list) else None
+            second_row = matrix[1] if isinstance(matrix[1], list) else None
+            if first_row is not None and second_row is not None and len(first_row) == 2 and len(second_row) == 2:
+                return {
+                    "TP": second_row[1],
+                    "TN": first_row[0],
+                    "FP": first_row[1],
+                    "FN": second_row[0],
+                }
+
+        return {"TP": "", "TN": "", "FP": "", "FN": ""}
 
     @staticmethod
     def build_summary_table(trial_results: list[dict[str, Any]], model_order: list[str]) -> str:

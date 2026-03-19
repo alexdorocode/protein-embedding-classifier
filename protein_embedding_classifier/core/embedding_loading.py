@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -328,6 +328,8 @@ class EmbeddingBundle:
     y_train: np.ndarray
     y_val: np.ndarray
     y_test: np.ndarray
+    X_zero_shot: dict[str, np.ndarray] = field(default_factory=dict)
+    y_zero_shot: np.ndarray = field(default_factory=lambda: np.asarray([], dtype=object))
 
     @classmethod
     def from_dataset(
@@ -341,10 +343,12 @@ class EmbeddingBundle:
         train_ids = dataset_bundle.train_ids
         val_ids = dataset_bundle.val_ids
         test_ids = dataset_bundle.test_ids
+        zero_shot_ids = list(getattr(dataset_bundle, "zero_shot_ids", []))
 
         x_train: dict[str, np.ndarray] = {}
         x_val: dict[str, np.ndarray] = {}
         x_test: dict[str, np.ndarray] = {}
+        x_zero_shot: dict[str, np.ndarray] = {}
 
         for model_name, model_embeddings in raw_embeddings.items():
             allow_missing = model_name in allowed_missing_model_artifacts
@@ -353,7 +357,7 @@ class EmbeddingBundle:
                 missing_all = sorted(
                     {
                         accession
-                        for accession in (train_ids + val_ids + test_ids)
+                        for accession in (train_ids + val_ids + test_ids + zero_shot_ids)
                         if accession not in model_embeddings
                     }
                 )
@@ -383,6 +387,14 @@ class EmbeddingBundle:
                 logger,
                 allow_missing=allow_missing,
             )
+            x_zero_shot[model_name] = cls._build_matrix(
+                model_name,
+                "zero_shot",
+                zero_shot_ids,
+                model_embeddings,
+                logger,
+                allow_missing=allow_missing,
+            )
 
         return cls(
             X_train=x_train,
@@ -391,6 +403,8 @@ class EmbeddingBundle:
             y_train=dataset_bundle.y_train,
             y_val=dataset_bundle.y_val,
             y_test=dataset_bundle.y_test,
+            X_zero_shot=x_zero_shot,
+            y_zero_shot=np.asarray(getattr(dataset_bundle, "y_zero_shot", np.asarray([], dtype=object))),
         )
 
     @staticmethod

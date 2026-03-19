@@ -119,7 +119,31 @@ class TorchTrainingWrapper:
             y_val_tensor = torch.tensor(y_val_enc, dtype=torch.long)
 
         dataset = torch.utils.data.TensorDataset(x_train_tensor, y_train_tensor)
-        train_loader = torch.utils.data.DataLoader(dataset, batch_size=int(self.batch_size), shuffle=True)
+        configured_batch_size = int(self.batch_size)
+        if self.use_batch_norm and configured_batch_size < 2:
+            configured_batch_size = 2
+
+        drop_last = (
+            bool(self.use_batch_norm)
+            and len(dataset) > 1
+            and configured_batch_size > 1
+            and (len(dataset) % configured_batch_size == 1)
+        )
+        try:
+            train_loader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=configured_batch_size,
+                shuffle=True,
+                drop_last=drop_last,
+            )
+        except TypeError as exc:
+            if "drop_last" not in str(exc):
+                raise
+            train_loader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=configured_batch_size,
+                shuffle=True,
+            )
 
         best_state = copy.deepcopy(self.model.state_dict())
         best_val_loss = float("inf")

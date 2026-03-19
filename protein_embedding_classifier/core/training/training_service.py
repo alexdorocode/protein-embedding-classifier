@@ -15,7 +15,7 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from sklearn.multiclass import OneVsRestClassifier
-from sklearn.preprocessing import MultiLabelBinarizer, StandardScaler, normalize
+from sklearn.preprocessing import LabelEncoder, MultiLabelBinarizer, StandardScaler, normalize
 
 from protein_embedding_classifier.core.decision.decision_policy import decide
 from protein_embedding_classifier.core.embedding_loading import EmbeddingBundle
@@ -80,6 +80,20 @@ class TrainingService:
                     params["criterion_name"] = problem_spec.loss_name
                 threshold_policy = self._resolve_threshold_policy(config, model_type, embedding_name)
 
+                y_train_for_model = y_train_processed
+                y_val_for_metrics = y_val_processed if problem_spec.problem_type == "multilabel" else y_val
+                y_test_for_metrics = (
+                    self._transform_multilabel_with_binarizer(embedding_bundle.y_test, multilabel_binarizer)
+                    if problem_spec.problem_type == "multilabel"
+                    else embedding_bundle.y_test
+                )
+
+                if problem_spec.problem_type != "multilabel" and model_type.upper() == "XGB":
+                    xgb_label_encoder = LabelEncoder()
+                    y_train_for_model = xgb_label_encoder.fit_transform(np.asarray(y_train))
+                    y_val_for_metrics = xgb_label_encoder.transform(np.asarray(y_val))
+                    y_test_for_metrics = xgb_label_encoder.transform(np.asarray(embedding_bundle.y_test))
+
                 self.logger.info(
                     "Training model_type=%s embedding=%s train_shape=%s val_shape=%s",
                     model_type,
@@ -103,7 +117,7 @@ class TrainingService:
                         raise ValueError(
                             f"model_type={model_type} does not expose predict_proba required for probability-based pipeline"
                         )
-                    model.fit(x_train_processed, y_train_processed)
+                    model.fit(x_train_processed, y_train_for_model)
                     raw_val_probs = model.predict_proba(x_val_processed)
                 else:
                     if not hasattr(model, "predict_proba"):
@@ -124,7 +138,7 @@ class TrainingService:
                 )
 
                 validation_metrics = self._compute_metrics(
-                    y_true=y_val_processed if problem_spec.problem_type == "multilabel" else y_val,
+                    y_true=y_val_for_metrics,
                     probs=val_probs,
                     problem_spec=problem_spec,
                     metrics_average=metrics_average,
@@ -141,13 +155,8 @@ class TrainingService:
                         classes=model_classes,
                         context=f"{model_type}/{embedding_name}/test",
                     )
-                    y_test_true = (
-                        self._transform_multilabel_with_binarizer(embedding_bundle.y_test, multilabel_binarizer)
-                        if problem_spec.problem_type == "multilabel"
-                        else embedding_bundle.y_test
-                    )
                     test_metrics = self._compute_metrics(
-                        y_true=y_test_true,
+                        y_true=y_test_for_metrics,
                         probs=test_probs,
                         problem_spec=problem_spec,
                         metrics_average=metrics_average,
@@ -268,18 +277,39 @@ class TrainingService:
 
         metrics["accuracy"] = float(accuracy_score(y_true_array, y_pred))
         if problem_spec.problem_type == "binary":
-            metrics["precision"] = float(precision_score(y_true_array, y_pred, zero_division=0))
-            metrics["recall"] = float(recall_score(y_true_array, y_pred, zero_division=0))
-            metrics["f1"] = float(f1_score(y_true_array, y_pred, zero_division=0))
+            if class_labels is not None:
+                class_array = np.asarray(class_labels)
+            else:
+                class_array = np.unique(y_true_array)
+            if class_array.size == 0:
+                raise ValueError("Binary metric computation requires at least one class label")
+            pos_label = class_array[-1]
+
+            metrics["precision"] = float(precision_score(y_true_array, y_pred, pos_label=pos_label, zero_division=0))
+            metrics["recall"] = float(recall_score(y_true_array, y_pred, pos_label=pos_label, zero_division=0))
+            metrics["f1"] = float(f1_score(y_true_array, y_pred, pos_label=pos_label, zero_division=0))
 
             if probs_array.ndim == 2 and probs_array.shape[1] == 2 and np.unique(y_true_array).size == 2:
-                y_score = probs_array[:, 1]
-                metrics["roc_auc"] = float(roc_auc_score(y_true_array, y_score))
-                metrics["pr_auc"] = float(average_precision_score(y_true_array, y_score))
+                pos_index = 1
+                if class_labels is not None:
+                    class_list = list(np.asarray(class_labels))
+                    if pos_label in class_list:
+                        pos_index = int(class_list.index(pos_label))
+                y_score = probs_array[:, pos_index]
+                y_true_bin = (y_true_array == pos_label).astype(int)
+                metrics["roc_auc"] = float(roc_auc_score(y_true_bin, y_score))
+                metrics["pr_auc"] = float(average_precision_score(y_true_bin, y_score))
 
             labels = np.unique(y_true_array)
             matrix = confusion_matrix(y_true_array, y_pred, labels=labels)
             metrics["confusion_matrix"] = matrix.tolist()
+
+            positive_mask_true = (y_true_array == pos_label)
+            positive_mask_pred = (np.asarray(y_pred) == pos_label)
+            metrics["tp"] = int(np.sum(positive_mask_true & positive_mask_pred))
+            metrics["tn"] = int(np.sum((~positive_mask_true) & (~positive_mask_pred)))
+            metrics["fp"] = int(np.sum((~positive_mask_true) & positive_mask_pred))
+            metrics["fn"] = int(np.sum(positive_mask_true & (~positive_mask_pred)))
             return metrics
 
         metrics["precision"] = float(precision_score(y_true_array, y_pred, average=metrics_average, zero_division=0))

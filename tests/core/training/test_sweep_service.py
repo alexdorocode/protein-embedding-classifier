@@ -190,8 +190,15 @@ def test_sweep_service_exports_results_csv(tmp_path):
     contents = output_path.read_text(encoding="utf-8")
     assert "model_type" in contents
     assert "embedding_name" in contents
-    assert "val_f1" in contents
+    assert "validation_f1" in contents
     assert "test_f1" in contents
+    assert "test_roc_auc" in contents
+    assert "test_pr_auc" in contents
+    assert "TP" in contents
+    assert "TN" in contents
+    assert "FP" in contents
+    assert "FN" in contents
+    assert "seed_used" in contents
 
 
 def test_sweep_logging_has_val_prefix_and_no_nan_test_metrics():
