@@ -1,0 +1,10 @@
+problems:
+  enzyme_vs_not:
+    type: binary
+    labels_sql: tasks/enzyme_vs_not/labels.sql
+    metrics: [accuracy, auroc]
+
+  localization:
+    type: multiclass
+    labels_sql: tasks/localization/labels.sql
+    metrics: [accuracy, macro_f1]

@@ -1,0 +1,15 @@
+db:
+  host: localhost
+  port: 5432
+  name: BioData_mfp_v1
+  user: usuario
+  password: clave
+
+  schema: public
+
+  tables:
+    esequence_embeddingss: sequence_embeddings
+    sequence_embedding_type: sequence_embedding_type
+    sequences: sequence
+    proteins: protein
+    structure_3di: structure_3di

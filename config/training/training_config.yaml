@@ -1,0 +1,33 @@
+wandb:
+  enabled: true
+  mode: offline
+  project: protein-embedding-classifier
+  entity: null
+
+embedding_groups:
+  sentence:
+    - ESM2
+    - ProtT5
+    - Ankh3-Large
+  graph:
+    - GeOKG
+
+sweep:
+  enabled_classifiers: []
+
+final_training:
+  enabled: true
+  retrain_on_train_val: true
+  evaluate_test: true
+  save_model: true
+  output_dir: ../../pec_data/artifacts/final_models
+
+reporting:
+  output_root: ../../pec_data
+  run_prefix: sweep
+  dataset_name: default_dataset
+  prediction_split: test
+  thresholds:
+    default: 0.5
+    classifier: {}
+    classifier_embedding: {}
