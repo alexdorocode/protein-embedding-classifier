@@ -1,0 +1,390 @@
+{
+  "catalog_version": "1.0",
+  "last_updated": "2026-08-03T10:51:00",
+  "description": "Central catalog for all dataset designer runs in Protein Embedding Classifier. This is the single source of truth for run metadata, species mapping, and terminology.",
+  "terminology_standard": {
+    "official_terms": {
+      "target_protein": "TP",
+      "non_target_protein": "NTP",
+      "target_protein_full": "Target Protein",
+      "non_target_protein_full": "Non-Target Protein"
+    },
+    "deprecated_terms": {
+      "mfp": "DO NOT USE - replaced by TP/NTP",
+      "multifunctional_protein": "DO NOT USE - replaced by TP/NTP",
+      "mf": "DO NOT USE - replaced by TP",
+      "nmf": "DO NOT USE - replaced by NTP",
+      "multifunctional": "DO NOT USE - replaced by TP/NTP classification"
+    },
+    "important_note": "This project does NOT study multifunctional proteins (MFP). It studies Target Proteins (TP) and Non-Target Proteins (NTP) for classification tasks. Any historical references to 'mf_', 'MF', 'multifunctional', etc. in filenames or code are legacy naming and should be interpreted as TP/NTP concepts only."
+  },
+  "species_categories": {
+    "humans": {
+      "description": "Human proteins only",
+      "scientific_name": "Homo sapiens",
+      "organism_filter": ["Homo sapiens (Human)."]
+    },
+    "model_organisms": {
+      "description": "Proteins from model organisms (multi-species)",
+      "scientific_names": [
+        "Arabidopsis thaliana (Mouse-ear cress).",
+        "Escherichia coli (strain K12).",
+        "Mus musculus (Mouse).",
+        "Saccharomyces cerevisiae (Baker's yeast)."
+      ],
+      "organism_filter": [
+        "Arabidopsis thaliana (Mouse-ear cress).",
+        "Escherichia coli (strain K12).",
+        "Mus musculus (Mouse).",
+        "Saccharomyces cerevisiae (Baker's yeast)."
+      ]
+    }
+  },
+  "runs": {
+    "20260803_0258_7672b947": {
+      "run_id": "20260803_0258_7672b947",
+      "short_id": "0258",
+      "species_category": "humans",
+      "species": "Homo sapiens (Human)",
+      "date": "2026-08-03",
+      "time": "02:58",
+      "config_hash": "7672b947",
+      "source_tool": "mfp-dataset-designer",
+      "pipeline_version": "target_non_target_v1",
+      "status": "completed",
+      "statistics": {
+        "filter1_rows": 1162306,
+        "filter2_rows": 22856,
+        "filter3_rows": 2351,
+        "final_rows": 2351,
+        "duration_seconds": 1415.625,
+        "random_seed": 42
+      },
+      "file_structure": {
+        "contract_version": "1.0",
+        "files": {
+          "candidatas_metricas.csv": {
+            "description": "GO similarity metrics for Non-Target Protein (NTP) candidates",
+            "role": "intermediate_metrics",
+            "stage": "filter1",
+            "contains": ["protein_id", "GO_similarity_metrics"]
+          },
+          "filter1_output.csv": {
+            "description": "Results after first filter (sequence length variance and identity)",
+            "role": "filter_output",
+            "stage": "filter1",
+            "contains": ["tp_id", "ntp_id", "sequence_metrics"]
+          },
+          "filter2_output.csv": {
+            "description": "Results after second filter (Poisson-weighted assignment)",
+            "role": "filter_output",
+            "stage": "filter2",
+            "contains": ["tp_id", "ntp_id", "assignment_scores"]
+          },
+          "filter3_output.csv": {
+            "description": "Results after third filter (outlier removal)",
+            "role": "filter_output",
+            "stage": "filter3",
+            "contains": ["tp_id", "ntp_id", "final_scores"]
+          },
+          "final_dataset.csv": {
+            "description": "MAIN DATASET: Final TP/NTP pairs for training and evaluation",
+            "role": "final_dataset",
+            "stage": "final",
+            "contains": ["tp_id", "ntp_id"],
+            "columns": [
+              {"name": "tp_id", "type": "string", "description": "Target Protein identifier"},
+              {"name": "ntp_id", "type": "string", "description": "Non-Target Protein identifier"}
+            ],
+            "note": "This is the primary file for model training. Each row represents a TP-NTP pair."
+          },
+          "matches_primer_filtro.csv": {
+            "description": "TP proteins that found matches in first filter",
+            "role": "filter_tracking",
+            "stage": "filter1"
+          },
+          "mf_assignments.csv": {
+            "description": "LEGACY NAME: Assignments of NTP candidates to TP proteins",
+            "role": "assignment",
+            "stage": "filter2",
+            "actual_content": "TP to NTP assignments",
+            "columns": [
+              {"name": "mf_id", "type": "string", "description": "ACTUALLY TP (Target Protein) identifier - legacy naming"},
+              {"name": "num_candidates", "type": "integer", "description": "Number of NTP candidates assigned"},
+              {"name": "candidates", "type": "string", "description": "Comma-separated list of NTP identifiers"}
+            ],
+            "terminology_note": "Despite filename 'mf_assignments', this file contains TP (Target Protein) to NTP (Non-Target Protein) assignments. The 'mf_id' column is actually TP."
+          },
+          "mf_metricas.csv": {
+            "description": "LEGACY NAME: GO similarity metrics for TP proteins",
+            "role": "metrics",
+            "stage": "filter2",
+            "actual_content": "TP GO metrics",
+            "terminology_note": "Despite filename 'mf_metricas', this file contains metrics for TP (Target Protein) only."
+          },
+          "mf_nmf_pairs.csv": {
+            "description": "LEGACY NAME: TP/NTP pairs from filter2",
+            "role": "pairs",
+            "stage": "filter2",
+            "actual_content": "TP-NTP pairs",
+            "terminology_note": "Despite filename 'mf_nmf_pairs', this contains TP-NTP pairs. Columns are tp_id and ntp_id."
+          },
+          "mf_not_possible.csv": {
+            "description": "LEGACY NAME: TP proteins without assignments",
+            "role": "excluded",
+            "stage": "filter2",
+            "actual_content": "TP without NTP assignments",
+            "terminology_note": "Despite filename, contains TP identifiers that could not be assigned NTP candidates."
+          },
+          "no_matches_primer_filtro.csv": {
+            "description": "TP proteins without matches in first filter",
+            "role": "filter_tracking",
+            "stage": "filter1"
+          },
+          "target_assignments.csv": {
+            "description": "Assignments of NTP candidates to TP proteins (correct terminology)",
+            "role": "assignment",
+            "stage": "filter2",
+            "columns": [
+              {"name": "target_id", "type": "string", "description": "Target Protein (TP) identifier"},
+              {"name": "num_candidates", "type": "integer", "description": "Number of NTP candidates assigned"},
+              {"name": "candidates", "type": "string", "description": "Comma-separated list of NTP identifiers"}
+            ],
+            "note": "This file uses correct terminology: target_id = TP, candidates = NTP"
+          },
+          "target_non_target_dataset.csv": {
+            "description": "TP/NTP pairs in dataset format",
+            "role": "dataset",
+            "stage": "final",
+            "columns": [
+              {"name": "target_id", "type": "string", "description": "Target Protein (TP) identifier"},
+              {"name": "non_target_id", "type": "string", "description": "Non-Target Protein (NTP) identifier"}
+            ],
+            "note": "Each row is a TP-NTP pair. Equivalent to final_dataset.csv but with different column names."
+          },
+          "target_non_target_pairs.csv": {
+            "description": "TP/NTP pairs (same as target_non_target_dataset.csv)",
+            "role": "pairs",
+            "stage": "final",
+            "note": "Redundant with target_non_target_dataset.csv"
+          },
+          "target_not_possible.csv": {
+            "description": "TP proteins without final assignments",
+            "role": "excluded",
+            "stage": "final"
+          },
+          "pipeline.log": {
+            "description": "Complete pipeline execution log",
+            "role": "logging",
+            "contains": ["timestamps", "filter_parameters", "execution_times", "warnings"]
+          },
+          "run_metadata.json": {
+            "description": "Run metadata and configuration",
+            "role": "metadata",
+            "contains": ["run_id", "timestamp", "species", "statistics", "terminology"]
+          }
+        }
+      },
+      "usage": {
+        "primary_training_file": "final_dataset.csv",
+        "alternative_training_files": ["target_non_target_dataset.csv", "target_non_target_pairs.csv"],
+        "assignment_files": ["target_assignments.csv", "mf_assignments.csv"],
+        "metrics_files": ["mf_metricas.csv", "candidatas_metricas.csv"],
+        "metadata_files": ["run_metadata.json", "pipeline.log"]
+      }
+    },
+    "20260803_0304_a68aa0bb": {
+      "run_id": "20260803_0304_a68aa0bb",
+      "short_id": "0304",
+      "species_category": "model_organisms",
+      "species": "Model Organisms (Multi-species)",
+      "date": "2026-08-03",
+      "time": "03:04",
+      "config_hash": "a68aa0bb",
+      "source_tool": "mfp-dataset-designer",
+      "pipeline_version": "target_non_target_v1",
+      "status": "completed",
+      "statistics": {
+        "filter1_rows": 241917,
+        "filter2_rows": 19532,
+        "filter3_rows": 1188,
+        "final_rows": 1188,
+        "duration_seconds": 422.141,
+        "random_seed": 42
+      },
+      "organism_filter": [
+        "Arabidopsis thaliana (Mouse-ear cress).",
+        "Escherichia coli (strain K12).",
+        "Mus musculus (Mouse).",
+        "Saccharomyces cerevisiae (Baker's yeast)."
+      ],
+      "file_structure": {
+        "contract_version": "1.0",
+        "files": {
+          "candidatas_metricas.csv": {
+            "description": "GO similarity metrics for Non-Target Protein (NTP) candidates",
+            "role": "intermediate_metrics",
+            "stage": "filter1"
+          },
+          "filter1_output.csv": {
+            "description": "Results after first filter",
+            "role": "filter_output",
+            "stage": "filter1"
+          },
+          "filter2_output.csv": {
+            "description": "Results after second filter",
+            "role": "filter_output",
+            "stage": "filter2"
+          },
+          "filter3_output.csv": {
+            "description": "Results after third filter",
+            "role": "filter_output",
+            "stage": "filter3"
+          },
+          "final_dataset.csv": {
+            "description": "MAIN DATASET: Final TP/NTP pairs for training and evaluation",
+            "role": "final_dataset",
+            "stage": "final",
+            "contains": ["tp_id", "ntp_id"],
+            "note": "This is the primary file for model training. Contains multi-species TP-NTP pairs."
+          },
+          "matches_primer_filtro.csv": {
+            "description": "TP proteins that found matches in first filter",
+            "role": "filter_tracking",
+            "stage": "filter1"
+          },
+          "mf_assignments.csv": {
+            "description": "LEGACY NAME: Assignments of NTP candidates to TP proteins",
+            "role": "assignment",
+            "stage": "filter2",
+            "actual_content": "TP to NTP assignments",
+            "terminology_note": "Despite filename 'mf_assignments', this file contains TP (Target Protein) to NTP (Non-Target Protein) assignments."
+          },
+          "mf_metricas.csv": {
+            "description": "LEGACY NAME: GO similarity metrics for TP proteins",
+            "role": "metrics",
+            "stage": "filter2",
+            "actual_content": "TP GO metrics",
+            "terminology_note": "Despite filename, this contains metrics for TP (Target Protein) only."
+          },
+          "mf_nmf_pairs.csv": {
+            "description": "LEGACY NAME: TP/NTP pairs from filter2",
+            "role": "pairs",
+            "stage": "filter2",
+            "actual_content": "TP-NTP pairs",
+            "terminology_note": "Despite filename, contains TP-NTP pairs."
+          },
+          "mf_not_possible.csv": {
+            "description": "LEGACY NAME: TP proteins without assignments",
+            "role": "excluded",
+            "stage": "filter2",
+            "actual_content": "TP without NTP assignments",
+            "terminology_note": "Despite filename, contains TP identifiers that could not be assigned NTP candidates."
+          },
+          "no_matches_primer_filtro.csv": {
+            "description": "TP proteins without matches in first filter",
+            "role": "filter_tracking",
+            "stage": "filter1"
+          },
+          "target_assignments.csv": {
+            "description": "Assignments of NTP candidates to TP proteins (correct terminology)",
+            "role": "assignment",
+            "stage": "filter2"
+          },
+          "target_non_target_dataset.csv": {
+            "description": "TP/NTP pairs in dataset format",
+            "role": "dataset",
+            "stage": "final"
+          },
+          "target_non_target_pairs.csv": {
+            "description": "TP/NTP pairs",
+            "role": "pairs",
+            "stage": "final"
+          },
+          "target_not_possible.csv": {
+            "description": "TP proteins without final assignments",
+            "role": "excluded",
+            "stage": "final"
+          },
+          "pipeline.log": {
+            "description": "Complete pipeline execution log",
+            "role": "logging"
+          },
+          "run_metadata.json": {
+            "description": "Run metadata and configuration",
+            "role": "metadata"
+          }
+        }
+      },
+      "usage": {
+        "primary_training_file": "final_dataset.csv",
+        "alternative_training_files": ["target_non_target_dataset.csv", "target_non_target_pairs.csv"],
+        "assignment_files": ["target_assignments.csv", "mf_assignments.csv"],
+        "metrics_files": ["mf_metricas.csv", "candidatas_metricas.csv"],
+        "metadata_files": ["run_metadata.json", "pipeline.log"]
+      }
+    }
+  },
+  "recommended_usage": {
+    "loading_runs": {
+      "python_function": "load_run(run_id, base_path='dataset_designer_runs')",
+      "returns": {
+        "tp_ntp_pairs": "DataFrame with tp_id, ntp_id columns",
+        "metadata": "Dictionary with run metadata",
+        "assignments": "Dictionary with TP to NTP assignments",
+        "metrics": "Dictionary with GO similarity metrics"
+      }
+    },
+    "comparing_species": {
+      "humans_run": "20260803_0258_7672b947",
+      "model_organisms_run": "20260803_0304_a68aa0bb",
+      "comparison_strategy": "Use same model architecture, compare performance metrics across runs"
+    },
+    "experiment_combinations": [
+      {
+        "name": "humans_only",
+        "run_id": "20260803_0258_7672b947",
+        "species": "humans"
+      },
+      {
+        "name": "model_organisms_only",
+        "run_id": "20260803_0304_a68aa0bb",
+        "species": "model_organisms"
+      },
+      {
+        "name": "cross_species_comparison",
+        "runs": ["20260803_0258_7672b947", "20260803_0304_a68aa0bb"],
+        "purpose": "Compare model performance between human and model organism proteins"
+      }
+    ]
+  },
+  "validation_rules": {
+    "required_files": [
+      "final_dataset.csv",
+      "run_metadata.json",
+      "pipeline.log",
+      "target_assignments.csv",
+      "mf_assignments.csv",
+      "mf_metricas.csv",
+      "candidatas_metricas.csv"
+    ],
+    "file_consistency_checks": [
+      {
+        "check": "final_dataset.csv must have tp_id and ntp_id columns",
+        "columns": ["tp_id", "ntp_id"]
+      },
+      {
+        "check": "target_non_target_dataset.csv must have target_id and non_target_id columns",
+        "columns": ["target_id", "non_target_id"]
+      },
+      {
+        "check": "All TP identifiers in final_dataset.csv must exist in target_assignments.csv",
+        "type": "referential_integrity"
+      },
+      {
+        "check": "run_metadata.json must contain species and species_category fields",
+        "fields": ["species", "species_category"]
+      }
+    ]
+  }
+}

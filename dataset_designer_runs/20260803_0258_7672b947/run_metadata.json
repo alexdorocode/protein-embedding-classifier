@@ -2,10 +2,20 @@
   "run_id": "20260803_0258_7672b947",
   "timestamp": "2026-08-03T03:21:45",
   "config_hash": "7672b947",
+  "species": "Homo sapiens (Human)",
+  "species_category": "humans",
   "filter1_rows": 1162306,
   "filter2_rows": 22856,
   "filter3_rows": 2351,
   "final_rows": 2351,
   "duration_seconds": 1415.625,
-  "random_seed": 42
+  "random_seed": 42,
+  "terminology": {
+    "target_protein": "TP",
+    "non_target_protein": "NTP",
+    "note": "This run uses TP/NTP terminology. Legacy files may contain 'mf_' or 'target_' prefixes but refer to TP/NTP concepts only."
+  },
+  "pipeline_version": "target_non_target_v1",
+  "source_tool": "mfp-dataset-designer",
+  "organism_filter": ["Homo sapiens (Human)."]
 }
