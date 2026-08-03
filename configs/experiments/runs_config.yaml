@@ -1,0 +1,144 @@
+# Runs Configuration for Protein Embedding Classifier
+# 
+# This file defines the configuration for dataset designer runs.
+# It serves as a central configuration point for run management.
+#
+# IMPORTANT TERMINOLOGY:
+# - TP = Target Protein (NOT Multifunctional Protein)
+# - NTP = Non-Target Protein (NOT Non-Multifunctional Protein)
+# - See docs/TERMINOLOGY_CLARIFICATION.md for details
+
+runs:
+  # Humans dataset (Homo sapiens only)
+  humans:
+    run_id: "20260803_0258_7672b947"
+    short_id: "0258"
+    species_category: "humans"
+    species: "Homo sapiens (Human)"
+    description: "Human proteins dataset for TP/NTP classification"
+    base_path: "dataset_designer_runs"
+    
+    # Primary files
+    primary_dataset: "final_dataset.csv"
+    alternative_datasets:
+      - "target_non_target_dataset.csv"
+      - "target_non_target_pairs.csv"
+    
+    # Assignment files (in order of preference)
+    assignment_files:
+      - "target_assignments.csv"  # Correct terminology
+      - "mf_assignments.csv"      # Legacy name
+    
+    # Metrics files
+    tp_metrics: "mf_metricas.csv"      # Legacy name, contains TP metrics
+    ntp_metrics: "candidatas_metricas.csv"
+    
+    # Metadata
+    metadata: "run_metadata.json"
+    pipeline_log: "pipeline.log"
+    
+    # Statistics from run
+    statistics:
+      filter1_rows: 1162306
+      filter2_rows: 22856
+      filter3_rows: 2351
+      final_rows: 2351
+      duration_seconds: 1415.625
+      random_seed: 42
+    
+    # Usage flags
+    use_for_training: true
+    use_for_validation: true
+    use_for_testing: true
+    use_for_benchmarking: true
+
+  # Model organisms dataset (multi-species)
+  model_organisms:
+    run_id: "20260803_0304_a68aa0bb"
+    short_id: "0304"
+    species_category: "model_organisms"
+    species: "Model Organisms (Multi-species)"
+    description: "Multi-species dataset for TP/NTP classification"
+    base_path: "dataset_designer_runs"
+    
+    # Organisms included
+    organisms:
+      - "Arabidopsis thaliana (Mouse-ear cress)."
+      - "Escherichia coli (strain K12)."
+      - "Mus musculus (Mouse)."
+      - "Saccharomyces cerevisiae (Baker's yeast)."
+    
+    # Primary files
+    primary_dataset: "final_dataset.csv"
+    alternative_datasets:
+      - "target_non_target_dataset.csv"
+      - "target_non_target_pairs.csv"
+    
+    # Assignment files
+    assignment_files:
+      - "target_assignments.csv"
+      - "mf_assignments.csv"
+    
+    # Metrics files
+    tp_metrics: "mf_metricas.csv"
+    ntp_metrics: "candidatas_metricas.csv"
+    
+    # Metadata
+    metadata: "run_metadata.json"
+    pipeline_log: "pipeline.log"
+    
+    # Statistics from run
+    statistics:
+      filter1_rows: 241917
+      filter2_rows: 19532
+      filter3_rows: 1188
+      final_rows: 1188
+      duration_seconds: 422.141
+      random_seed: 42
+    
+    # Usage flags
+    use_for_training: true
+    use_for_validation: true
+    use_for_testing: true
+    use_for_benchmarking: true
+
+# Experiment configurations
+ experiments:
+  # Single species experiments
+  humans_only:
+    name: "Humans Only"
+    description: "Train and evaluate on human proteins only"
+    run_id: "20260803_0258_7672b947"
+    species: "humans"
+    
+  model_organisms_only:
+    name: "Model Organisms Only"
+    description: "Train and evaluate on model organism proteins only"
+    run_id: "20260803_0304_a68aa0bb"
+    species: "model_organisms"
+    
+  # Cross-species experiments
+  cross_species_humans_to_model:
+    name: "Cross-Species: Humans to Model"
+    description: "Train on humans, test on model organisms"
+    train_run: "20260803_0258_7672b947"
+    test_run: "20260803_0304_a68aa0bb"
+    train_species: "humans"
+    test_species: "model_organisms"
+    
+  cross_species_model_to_humans:
+    name: "Cross-Species: Model to Humans"
+    description: "Train on model organisms, test on humans"
+    train_run: "20260803_0304_a68aa0bb"
+    test_run: "20260803_0258_7672b947"
+    train_species: "model_organisms"
+    test_species: "humans"
+    
+  # Combined experiments
+  combined_all:
+    name: "Combined All Species"
+    description: "Combine both runs for multi-species training"
+    runs:
+      - "20260803_0258_7672b947"
+      - "20260803_0304_a68aa0bb"
+    species: "combined"

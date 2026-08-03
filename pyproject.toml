@@ -3,7 +3,10 @@ name = "protein-embedding-classifier"
 version = "0.1.0"
 description = "Protein embedding classification experiments and runners"
 authors = ["Alex Doro <alex@example.com>"]
-packages = [{ include = "protein_embedding_classifier" }]
+packages = [
+    { include = "src" },
+    { include = "protein_embedding_classifier" }
+]
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.13"
@@ -21,11 +24,15 @@ torch = "^2.10.0"
 pytest = "^8.3.5"
 
 [tool.pytest.ini_options]
-pythonpath = [".", "protein_embedding_classifier"]
+pythonpath = [".", "src", "protein_embedding_classifier"]
 testpaths = ["tests"]
 
 [tool.poetry.scripts]
 pec = "protein_embedding_classifier.main:main"
+train = "scripts.train:main"
+predict = "scripts.predict:main"
+benchmark = "scripts.benchmark:main"
+export-dataset = "scripts.export_dataset:main"
 
 [build-system]
 requires = ["poetry-core>=1.9.0"]
