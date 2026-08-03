@@ -10,7 +10,7 @@ from typing import List, Dict, Any, Optional
 import logging
 import json
 
-from pec.dataset.policies.models import (
+from src.dataset_builder.policies.models import (
     DatasetPolicy,
     SelectionStrategy,
     RatioPolicy,

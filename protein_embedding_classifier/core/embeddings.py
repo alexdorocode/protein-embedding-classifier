@@ -19,7 +19,7 @@ from typing import Dict, Tuple, List
 
 import numpy as np
 
-from protein_embedding_classifier.core.db import (
+from src.training.db import (
     load_embeddings,
     resolve_embedding_type_id,
 )

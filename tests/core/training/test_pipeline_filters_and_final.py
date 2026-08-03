@@ -3,8 +3,8 @@ from pathlib import Path
 
 import numpy as np
 
-from protein_embedding_classifier.core.embedding_loading import EmbeddingBundle
-from protein_embedding_classifier.core.pipeline import Pipeline
+from src.training.embedding_loading import EmbeddingBundle
+from src.training.pipeline import Pipeline
 
 
 def test_resolve_selected_embeddings_with_group_and_name_filter():
@@ -83,7 +83,7 @@ def test_final_training_writes_result_and_model(monkeypatch, tmp_path):
             }
         }
 
-    from protein_embedding_classifier.core.training.training_service import TrainingService
+    from src.training.training.training_service import TrainingService
 
     monkeypatch.setattr(TrainingService, "train", fake_train)
     monkeypatch.setattr(Pipeline, "_wandb_init_run", staticmethod(lambda **kwargs: None))
@@ -255,7 +255,7 @@ def test_run_sweep_step_returns_cleanly_when_all_classifiers_skipped(monkeypatch
     monkeypatch.setattr(Pipeline, "_load_training_config", staticmethod(lambda conf: {"final_training": {"enabled": False}}))
     monkeypatch.setattr(Pipeline, "_resolve_classifier_sweeps", staticmethod(lambda conf: {"MLP": "dummy.yaml"}))
 
-    from protein_embedding_classifier.core.training.sweep_service import SweepService
+    from src.training.training.sweep_service import SweepService
 
     def fake_run(self, **kwargs):
         raise ImportError("MLP model requested but torch is not installed")
@@ -306,7 +306,7 @@ def test_final_training_continues_when_model_pickle_fails(monkeypatch, caplog, t
             }
         }
 
-    from protein_embedding_classifier.core.training.training_service import TrainingService
+    from src.training.training.training_service import TrainingService
 
     monkeypatch.setattr(TrainingService, "train", fake_train)
     monkeypatch.setattr(Pipeline, "_wandb_init_run", staticmethod(lambda **kwargs: None))

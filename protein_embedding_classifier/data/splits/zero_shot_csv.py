@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
-from protein_embedding_classifier.data.splits.base import SplitStrategy
+from src.dataset_builder.splits.base import SplitStrategy
 
 
 class ZeroShotCSVSplit(SplitStrategy):

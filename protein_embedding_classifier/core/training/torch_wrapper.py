@@ -86,7 +86,7 @@ class TorchTrainingWrapper:
         inferred_output_size = self.output_size if self.output_size is not None else int(len(self.classes_))
 
         try:
-            from protein_embedding_classifier.classifiers.mlp_protein_classifier import MLPProteinClassifier
+            from src.training.models.mlp_protein_classifier import MLPProteinClassifier
         except ImportError as exc:
             raise ImportError(
                 "MLP model requested but MLPProteinClassifier dependencies are not available. "

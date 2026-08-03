@@ -11,7 +11,7 @@ Key Classes:
 - CandidatePoolPolicy: Defines pool constraints and scarcity handling
 """
 
-from pec.dataset.policies.models import (
+from src.dataset_builder.policies.models import (
     DatasetPolicy,
     SelectionStrategy,
     RatioPolicy,
@@ -20,7 +20,7 @@ from pec.dataset.policies.models import (
     OrganismPolicy,
     DuplicatePolicy,
 )
-from pec.dataset.policies.validator import PolicyValidator
+from src.dataset_builder.policies.validator import PolicyValidator
 
 __all__ = [
     "DatasetPolicy",

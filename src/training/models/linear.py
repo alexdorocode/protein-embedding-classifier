@@ -6,7 +6,7 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score
 
-from protein_embedding_classifier.classifiers.base import BaseClassifier
+from src.training.models.base import BaseClassifier
 
 
 class LogisticRegressionClassifier(BaseClassifier):

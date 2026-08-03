@@ -12,8 +12,8 @@ from dataclasses import dataclass
 import random
 import logging
 
-from pec.dataset.generator.models import AssignmentRecord
-from pec.dataset.splits.models import SplitManifest, SplitStrategyConfig, LeakageGuards, SplitArtifact
+from src.dataset_builder.generator.models import AssignmentRecord
+from src.dataset_builder.splits.models import SplitManifest, SplitStrategyConfig, LeakageGuards, SplitArtifact
 
 
 class SplitStrategy(ABC):

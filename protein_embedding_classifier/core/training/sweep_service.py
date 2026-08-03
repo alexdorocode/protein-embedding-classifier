@@ -10,10 +10,10 @@ from typing import Any
 
 import numpy as np
 
-from protein_embedding_classifier.core.embedding_loading import EmbeddingBundle
-from protein_embedding_classifier.core.training.model_factory import ModelFactory
-from protein_embedding_classifier.core.training.problem_specification import ProblemSpecification
-from protein_embedding_classifier.core.training.training_service import TrainingService
+from src.training.embedding_loading import EmbeddingBundle
+from src.training.training.model_factory import ModelFactory
+from src.training.training.problem_specification import ProblemSpecification
+from src.training.training.training_service import TrainingService
 
 
 @dataclass(frozen=True)

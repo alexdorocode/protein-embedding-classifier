@@ -9,13 +9,13 @@ import tempfile
 import os
 from pathlib import Path
 
-from pec.dataset.input.reader import UniverseReader
-from pec.dataset.input.normalizer import UniverseNormalizer
-from pec.dataset.policies.models import DatasetPolicy, RatioPolicy, CandidatePoolPolicy
-from pec.dataset.generator.generator import DatasetVariantGenerator
-from pec.dataset.splits.strategies import GroupByTargetSplitStrategy
-from pec.dataset.lineage.builder import LineageBuilder
-from pec.dataset.export.exporter import BundleExporter
+from src.dataset_builder.input.reader import UniverseReader
+from src.dataset_builder.input.normalizer import UniverseNormalizer
+from src.dataset_builder.policies.models import DatasetPolicy, RatioPolicy, CandidatePoolPolicy
+from src.dataset_builder.generator.generator import DatasetVariantGenerator
+from src.dataset_builder.splits.strategies import GroupByTargetSplitStrategy
+from src.dataset_builder.lineage.builder import LineageBuilder
+from src.dataset_builder.export.exporter import BundleExporter
 
 
 class TestIntegration:

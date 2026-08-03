@@ -5,7 +5,7 @@ import random
 import re
 from typing import Any, Dict, List, Tuple
 
-from protein_embedding_classifier.data.splits.base import SplitStrategy
+from src.dataset_builder.splits.base import SplitStrategy
 
 
 class ZeroShotOrganismSplit(SplitStrategy):

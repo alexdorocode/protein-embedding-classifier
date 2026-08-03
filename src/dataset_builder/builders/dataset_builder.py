@@ -6,9 +6,9 @@ from typing import Any, Dict, List
 
 import numpy as np
 
-from protein_embedding_classifier.data.label_loader import LabelLoader
-from protein_embedding_classifier.data.protein_loader import ProteinLoader
-from protein_embedding_classifier.data.splits.base import SplitStrategy
+from src.dataset_builder.label_loader import LabelLoader
+from src.input.protein_loader import ProteinLoader
+from src.dataset_builder.splits.models import SplitStrategy
 
 
 @dataclass

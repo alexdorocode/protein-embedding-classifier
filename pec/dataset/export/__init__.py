@@ -8,7 +8,7 @@ Key Classes:
 - BundleExporter: Exports bundles to filesystem
 """
 
-from pec.dataset.export.models import DatasetBundle
-from pec.dataset.export.exporter import BundleExporter
+from src.dataset_builder.export.models import DatasetBundle
+from src.dataset_builder.export.exporter import BundleExporter
 
 __all__ = ["DatasetBundle", "BundleExporter"]

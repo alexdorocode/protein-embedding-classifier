@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from protein_embedding_classifier.core.pipeline import Pipeline
+from src.training.pipeline import Pipeline
 
 
 def _confusion_counts(y_true: list[int], y_pred: list[int]) -> tuple[int, int, int, int]:

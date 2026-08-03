@@ -10,7 +10,7 @@ Key Classes:
 - TransformStep: Record of a transformation step
 """
 
-from pec.dataset.lineage.models import LineageManifest, SourceArtifact, TransformStep, RuntimeInfo
-from pec.dataset.lineage.builder import LineageBuilder
+from src.dataset_builder.lineage.models import LineageManifest, SourceArtifact, TransformStep, RuntimeInfo
+from src.dataset_builder.lineage.builder import LineageBuilder
 
 __all__ = ["LineageBuilder", "LineageManifest", "SourceArtifact", "TransformStep", "RuntimeInfo"]

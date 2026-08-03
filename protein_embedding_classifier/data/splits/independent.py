@@ -8,8 +8,8 @@ from typing import Any, Dict, List, Tuple
 import pandas as pd
 from sklearn.model_selection import KFold
 
-from protein_embedding_classifier.data.splits.base import SplitStrategy
-from protein_embedding_classifier.data.splits.zero_shot_organism import ZeroShotOrganismSplit
+from src.dataset_builder.splits.base import SplitStrategy
+from src.dataset_builder.splits.zero_shot_organism import ZeroShotOrganismSplit
 
 
 class IndependentValidationTrainTestSplit(SplitStrategy):

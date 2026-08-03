@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Tuple
 
 from sklearn.model_selection import KFold
 
-from protein_embedding_classifier.data.splits.base import SplitStrategy
+from src.dataset_builder.splits.base import SplitStrategy
 
 
 class CrossValidationSplit(SplitStrategy):

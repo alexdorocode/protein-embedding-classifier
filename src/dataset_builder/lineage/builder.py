@@ -13,7 +13,7 @@ import logging
 import os
 from pathlib import Path
 
-from pec.dataset.lineage.models import (
+from src.dataset_builder.lineage.models import (
     LineageManifest,
     SourceArtifact,
     TransformStep,

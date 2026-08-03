@@ -1,6 +1,6 @@
 import numpy as np
 
-from protein_embedding_classifier.core.training.problem_specification import ProblemSpecification
+from src.training.training.problem_specification import ProblemSpecification
 
 
 def test_problem_specification_binary_config():

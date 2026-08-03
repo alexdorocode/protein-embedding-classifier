@@ -12,13 +12,13 @@ import csv
 import json
 import logging
 
-from pec.dataset.generator.models import DatasetVariant, AssignmentRecord
-from pec.dataset.splits.models import SplitArtifact, SplitManifest
-from pec.dataset.input.models import UniverseManifest
-from pec.dataset.policies.models import DatasetPolicy
-from pec.dataset.generator.models import VariantManifest
-from pec.dataset.lineage.models import LineageManifest
-from pec.dataset.export.models import DatasetBundle, DatasetSummary
+from src.dataset_builder.generator.models import DatasetVariant, AssignmentRecord
+from src.dataset_builder.splits.models import SplitArtifact, SplitManifest
+from src.dataset_builder.input.models import UniverseManifest
+from src.dataset_builder.policies.models import DatasetPolicy
+from src.dataset_builder.generator.models import VariantManifest
+from src.dataset_builder.lineage.models import LineageManifest
+from src.dataset_builder.export.models import DatasetBundle, DatasetSummary
 
 
 class BundleExporter:

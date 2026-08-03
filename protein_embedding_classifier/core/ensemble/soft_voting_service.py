@@ -11,8 +11,8 @@ import numpy as np
 from sklearn.metrics import f1_score
 from sklearn.preprocessing import MultiLabelBinarizer
 
-from protein_embedding_classifier.core.decision.decision_policy import decide
-from protein_embedding_classifier.core.probability.probability_adapter import ProbabilityAdapter
+from src.training.decision.decision_policy import decide
+from src.training.probability.probability_adapter import ProbabilityAdapter
 
 
 class SoftVotingContractError(RuntimeError):

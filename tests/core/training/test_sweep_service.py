@@ -3,8 +3,8 @@ import types
 
 import numpy as np
 
-from protein_embedding_classifier.core.embedding_loading import EmbeddingBundle
-from protein_embedding_classifier.core.training.sweep_service import SweepService
+from src.training.embedding_loading import EmbeddingBundle
+from src.training.training.sweep_service import SweepService
 
 
 def _bundle():
@@ -67,7 +67,7 @@ def test_sweep_service_single_iteration_with_mocked_wandb(monkeypatch):
         embedding_name = next(iter(embedding_bundle.X_train.keys()))
         return _fake_train_payload(embedding_name, score=0.7)
 
-    from protein_embedding_classifier.core.training.training_service import TrainingService
+    from src.training.training.training_service import TrainingService
 
     monkeypatch.setattr(TrainingService, "train", fake_train)
 
@@ -110,7 +110,7 @@ def test_sweep_service_metric_goal_minimize(monkeypatch, tmp_path):
             }
         }
 
-    from protein_embedding_classifier.core.training.training_service import TrainingService
+    from src.training.training.training_service import TrainingService
 
     monkeypatch.setattr(TrainingService, "train", fake_train)
     monkeypatch.setattr(SweepService, "_wandb_init", staticmethod(lambda **kwargs: None))
@@ -150,7 +150,7 @@ def test_sweep_service_collects_trial_results(monkeypatch, tmp_path):
         embedding_name = next(iter(embedding_bundle.X_train.keys()))
         return _fake_train_payload(embedding_name, score=0.4)
 
-    from protein_embedding_classifier.core.training.training_service import TrainingService
+    from src.training.training.training_service import TrainingService
 
     monkeypatch.setattr(TrainingService, "train", fake_train)
 

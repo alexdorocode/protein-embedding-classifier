@@ -18,7 +18,7 @@ from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, Protocol, runtime_checkable
 from pathlib import Path
 
-from pec.dataset.contracts import (
+from src.dataset_builder.contracts import (
     ClassifierProtocol,
     AggregatorProtocol,
     ExperimentManifestProtocol,
@@ -201,7 +201,7 @@ class TestEmbeddingLoading:
     
     def test_embedding_loader_protocol_structure(self):
         """Test that EmbeddingLoaderProtocol has required methods."""
-        from pec.dataset.contracts import EmbeddingLoaderProtocol
+        from src.dataset_builder.contracts import EmbeddingLoaderProtocol
         assert hasattr(EmbeddingLoaderProtocol, "load")
         assert hasattr(EmbeddingLoaderProtocol, "get_embedding_dim")
     
@@ -223,7 +223,7 @@ class TestDatasetLayerCompatibility:
     
     def test_dataset_bundle_structure(self):
         """Test that dataset bundles have the expected structure."""
-        from pec.dataset.export.models import DatasetBundle
+        from src.dataset_builder.export.models import DatasetBundle
         
         # Verify the expected structure
         bundle = DatasetBundle(

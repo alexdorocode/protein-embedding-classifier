@@ -3,7 +3,7 @@ Tests for policy models.
 """
 
 import pytest
-from pec.dataset.policies.models import (
+from src.dataset_builder.policies.models import (
     DatasetPolicy,
     SelectionStrategy,
     RatioPolicy,

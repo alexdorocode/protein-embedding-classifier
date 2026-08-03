@@ -20,9 +20,9 @@ import yaml
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_score, recall_score
 from sklearn.preprocessing import MultiLabelBinarizer
 
-from protein_embedding_classifier.core.decision.decision_policy import decide
-from protein_embedding_classifier.core.db import create_engine_from_config, load_db_config
-from protein_embedding_classifier.core.ensemble.soft_voting_service import (
+from src.training.decision.decision_policy import decide
+from src.training.db import create_engine_from_config, load_db_config
+from src.training.ensemble.soft_voting_service import (
     EnsembleConfig,
     EnsembleMode,
     EnsembleSelectionConfig,
@@ -33,26 +33,26 @@ from protein_embedding_classifier.core.ensemble.soft_voting_service import (
     WeightingConfig,
     WeightingStrategyType,
 )
-from protein_embedding_classifier.core.embedding_loading import EmbeddingBundle, EmbeddingService
-from protein_embedding_classifier.core.probability.probability_adapter import ProbabilityAdapter
-from protein_embedding_classifier.core.statistics.friedman_test import run_friedman_test
-from protein_embedding_classifier.core.statistics.nemenyi_test import run_nemenyi_posthoc
-from protein_embedding_classifier.core.statistics.ranking_utils import (
+from src.training.embedding_loading import EmbeddingBundle, EmbeddingService
+from src.training.probability.probability_adapter import ProbabilityAdapter
+from src.training.statistics.friedman_test import run_friedman_test
+from src.training.statistics.nemenyi_test import run_nemenyi_posthoc
+from src.training.statistics.ranking_utils import (
     build_score_matrix,
     compute_average_ranks,
     compute_rank_matrix,
 )
-from protein_embedding_classifier.core.training.problem_specification import ProblemSpecification
-from protein_embedding_classifier.core.training.sweep_service import SweepService
-from protein_embedding_classifier.core.training.training_service import TrainingService
-from protein_embedding_classifier.data.dataset_builder import DatasetBuilder
-from protein_embedding_classifier.data.label_loader import LabelLoader
-from protein_embedding_classifier.data.protein_loader import ProteinLoader
-from protein_embedding_classifier.data.splits.cross_validation import CrossValidationSplit
-from protein_embedding_classifier.data.splits.independent import IndependentValidationTrainTestSplit
-from protein_embedding_classifier.data.splits.zero_shot_csv import ZeroShotCSVSplit
-from protein_embedding_classifier.data.splits.zero_shot_organism import ZeroShotOrganismSplit
-from protein_embedding_classifier.data.splits.zero_shot_random import ZeroShotRandomSplit
+from src.training.training.problem_specification import ProblemSpecification
+from src.training.training.sweep_service import SweepService
+from src.training.training.training_service import TrainingService
+from src.dataset_builder.dataset_builder import DatasetBuilder
+from src.dataset_builder.label_loader import LabelLoader
+from src.dataset_builder.protein_loader import ProteinLoader
+from src.dataset_builder.splits.cross_validation import CrossValidationSplit
+from src.dataset_builder.splits.independent import IndependentValidationTrainTestSplit
+from src.dataset_builder.splits.zero_shot_csv import ZeroShotCSVSplit
+from src.dataset_builder.splits.zero_shot_organism import ZeroShotOrganismSplit
+from src.dataset_builder.splits.zero_shot_random import ZeroShotRandomSplit
 
 
 PIPELINE_STEPS = ["dataset", "embeddings", "train", "sweep", "ensemble", "benchmark", "evaluate"]
@@ -5207,7 +5207,7 @@ class Pipeline:
                 return pickle.load(handle)
 
         if serializer == "mlp_state_dict":
-            from protein_embedding_classifier.classifiers.mlp_protein_classifier import MLPProteinClassifier
+            from src.training.models.mlp_protein_classifier import MLPProteinClassifier
             import torch
 
             metadata_path = model_path.with_suffix(".metadata.json")

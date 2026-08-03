@@ -9,7 +9,7 @@ Key Classes:
 - AssignmentTable: Canonical assignments table for a variant
 """
 
-from pec.dataset.generator.models import DatasetVariant, AssignmentRecord, VariantManifest
-from pec.dataset.generator.generator import DatasetVariantGenerator
+from src.dataset_builder.generator.models import DatasetVariant, AssignmentRecord, VariantManifest
+from src.dataset_builder.generator.generator import DatasetVariantGenerator
 
 __all__ = ["DatasetVariant", "AssignmentRecord", "VariantManifest", "DatasetVariantGenerator"]

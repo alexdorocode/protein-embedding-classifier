@@ -6,8 +6,8 @@ import pytest
 import tempfile
 import os
 from pathlib import Path
-from pec.dataset.input.reader import UniverseReader
-from pec.dataset.input.models import UniverseRecord
+from src.dataset_builder.input.reader import UniverseReader
+from src.dataset_builder.input.models import UniverseRecord
 
 
 class TestUniverseReader:

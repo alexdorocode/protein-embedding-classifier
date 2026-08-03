@@ -3,7 +3,7 @@ Tests for UniverseRecord and related models.
 """
 
 import pytest
-from pec.dataset.input.models import UniverseRecord, PoolConstraints, PoolMetadata, UniverseManifest
+from src.dataset_builder.input.models import UniverseRecord, PoolConstraints, PoolMetadata, UniverseManifest
 
 
 class TestPoolConstraints:

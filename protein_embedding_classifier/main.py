@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from protein_embedding_classifier.core.pipeline import Pipeline
+from src.training.pipeline import Pipeline
 from protein_embedding_classifier.logging_config import configure_logging
 
 # poetry env use /home/alexdoro/.cache/pypoetry/virtualenvs/protein-embedding-classifier-l632joPH-py3.11/bin/python && poetry env info

@@ -10,8 +10,8 @@ Key Classes:
 - UniverseNormalizer: Normalizes raw input into UniverseRecord instances
 """
 
-from pec.dataset.input.models import UniverseRecord, UniverseManifest
-from pec.dataset.input.reader import UniverseReader
-from pec.dataset.input.normalizer import UniverseNormalizer
+from src.dataset_builder.input.models import UniverseRecord, UniverseManifest
+from src.dataset_builder.input.reader import UniverseReader
+from src.dataset_builder.input.normalizer import UniverseNormalizer
 
 __all__ = ["UniverseRecord", "UniverseManifest", "UniverseReader", "UniverseNormalizer"]

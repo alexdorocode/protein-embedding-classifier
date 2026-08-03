@@ -17,11 +17,11 @@ from sklearn.metrics import (
 from sklearn.multiclass import OneVsRestClassifier
 from sklearn.preprocessing import LabelEncoder, MultiLabelBinarizer, StandardScaler, normalize
 
-from protein_embedding_classifier.core.decision.decision_policy import decide
-from protein_embedding_classifier.core.embedding_loading import EmbeddingBundle
-from protein_embedding_classifier.core.probability.probability_adapter import ProbabilityAdapter
-from protein_embedding_classifier.core.training.model_factory import ModelFactory
-from protein_embedding_classifier.core.training.problem_specification import ProblemSpecification
+from src.training.decision.decision_policy import decide
+from src.training.embedding_loading import EmbeddingBundle
+from src.training.probability.probability_adapter import ProbabilityAdapter
+from src.training.training.model_factory import ModelFactory
+from src.training.training.problem_specification import ProblemSpecification
 
 
 class TrainingService:

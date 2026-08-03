@@ -1,4 +1,4 @@
-from protein_embedding_classifier.core.ensemble import (
+from src.training.ensemble import (
 	EnsembleConfig,
 	EnsembleMode,
 	EnsembleSelectionConfig,

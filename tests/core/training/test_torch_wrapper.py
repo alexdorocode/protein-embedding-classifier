@@ -2,7 +2,7 @@ import types
 
 import numpy as np
 
-from protein_embedding_classifier.core.training.torch_wrapper import TorchTrainingWrapper
+from src.training.training.torch_wrapper import TorchTrainingWrapper
 
 
 class FakeTensor:

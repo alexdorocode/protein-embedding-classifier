@@ -3,8 +3,8 @@ Tests for UniverseNormalizer.
 """
 
 import pytest
-from pec.dataset.input.normalizer import UniverseNormalizer
-from pec.dataset.input.models import UniverseRecord, UniverseManifest
+from src.dataset_builder.input.normalizer import UniverseNormalizer
+from src.dataset_builder.input.models import UniverseRecord, UniverseManifest
 
 
 class TestUniverseNormalizer:

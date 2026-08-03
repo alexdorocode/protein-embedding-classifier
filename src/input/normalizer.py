@@ -13,7 +13,7 @@ import logging
 from datetime import datetime
 import json
 
-from pec.dataset.input.models import UniverseRecord, UniverseManifest
+from src.dataset_builder.input.models import UniverseRecord, UniverseManifest
 
 
 class UniverseNormalizer:

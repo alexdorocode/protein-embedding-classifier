@@ -12,12 +12,12 @@ Core Concepts (from contract):
 - Bundle: Self-contained export package for downstream PEC stages
 """
 
-from pec.dataset.input import UniverseReader, UniverseNormalizer, UniverseRecord
-from pec.dataset.policies import DatasetPolicy, PolicyValidator
-from pec.dataset.generator import DatasetVariantGenerator, DatasetVariant
-from pec.dataset.splits import SplitStrategy, GroupByTargetSplitStrategy
-from pec.dataset.lineage import LineageBuilder, LineageManifest
-from pec.dataset.export import BundleExporter, DatasetBundle
+from src.dataset_builder.input import UniverseReader, UniverseNormalizer, UniverseRecord
+from src.dataset_builder.policies import DatasetPolicy, PolicyValidator
+from src.dataset_builder.generator import DatasetVariantGenerator, DatasetVariant
+from src.dataset_builder.splits import SplitStrategy, GroupByTargetSplitStrategy
+from src.dataset_builder.lineage import LineageBuilder, LineageManifest
+from src.dataset_builder.export import BundleExporter, DatasetBundle
 
 __all__ = [
     # Input

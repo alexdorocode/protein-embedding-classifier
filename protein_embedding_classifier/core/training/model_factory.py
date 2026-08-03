@@ -8,7 +8,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import SVC
 
-from protein_embedding_classifier.core.training.torch_wrapper import TorchTrainingWrapper
+from src.training.training.torch_wrapper import TorchTrainingWrapper
 
 
 class ModelFactory:

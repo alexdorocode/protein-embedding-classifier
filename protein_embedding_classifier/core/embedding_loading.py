@@ -10,8 +10,8 @@ import pandas as pd
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 
-from protein_embedding_classifier.core.db import coerce_embedding_vector
-from protein_embedding_classifier.data.dataset_builder import DatasetBundle
+from src.training.db import coerce_embedding_vector
+from src.dataset_builder.dataset_builder import DatasetBundle
 
 
 LayeredSequenceEmbeddings = dict[str, dict[str, dict[int, np.ndarray]]]

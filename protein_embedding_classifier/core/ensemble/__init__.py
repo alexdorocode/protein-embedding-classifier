@@ -1,4 +1,4 @@
-from protein_embedding_classifier.core.ensemble.soft_voting_service import (
+from src.training.ensemble.soft_voting_service import (
     EnsembleConfig,
     EnsembleMode,
     EnsembleSelectionConfig,
