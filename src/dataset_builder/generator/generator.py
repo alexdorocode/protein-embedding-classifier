@@ -12,7 +12,7 @@ from dataclasses import field
 import logging
 from datetime import datetime
 
-from src.dataset_builder.input.models import UniverseRecord
+from src.dataset_builder.models import UniverseRecord
 from src.dataset_builder.policies.models import DatasetPolicy
 from src.dataset_builder.generator.models import (
     DatasetVariant,

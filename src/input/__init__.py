@@ -17,8 +17,8 @@ from .csv_loader import CSVLoader
 from .db_loader import DatabaseLoader
 from .api_loader import APILoader
 from .protein_loader import ProteinLoader
-from .reader import Reader
-from .normalizer import Normalizer
+from .reader import UniverseReader
+from .normalizer import UniverseNormalizer
 from .validators import DataValidator
 from .models import InputConfig
 
@@ -28,8 +28,8 @@ __all__ = [
     'DatabaseLoader', 
     'APILoader',
     'ProteinLoader',
-    'Reader',
-    'Normalizer',
+    'UniverseReader',
+    'UniverseNormalizer',
     'DataValidator',
     'InputConfig',
     'load_data',

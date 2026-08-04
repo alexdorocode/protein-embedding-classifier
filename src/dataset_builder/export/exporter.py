@@ -14,7 +14,7 @@ import logging
 
 from src.dataset_builder.generator.models import DatasetVariant, AssignmentRecord
 from src.dataset_builder.splits.models import SplitArtifact, SplitManifest
-from src.dataset_builder.input.models import UniverseManifest
+from src.dataset_builder.models import UniverseManifest
 from src.dataset_builder.policies.models import DatasetPolicy
 from src.dataset_builder.generator.models import VariantManifest
 from src.dataset_builder.lineage.models import LineageManifest

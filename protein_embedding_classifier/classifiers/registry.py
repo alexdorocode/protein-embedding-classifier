@@ -2,15 +2,15 @@ from __future__ import annotations
 
 from typing import Type, Dict
 
-from src.training.models.base import BaseClassifier
-from src.training.models.linear import LogisticRegressionClassifier
-from src.training.models.mlp import MLPClassifierWrapper
-from src.training.models.random_forest import RandomForestClassifierWrapper
+from protein_embedding_classifier.classifiers.base import BaseClassifier
+from protein_embedding_classifier.classifiers.linear import LogisticRegressionClassifier
+from protein_embedding_classifier.classifiers.mlp_protein_classifier import MLPProteinClassifier
+from protein_embedding_classifier.classifiers.random_forest import RandomForestClassifierWrapper
 
 
 CLASSIFIERS: Dict[str, Type[BaseClassifier]] = {
     "lr": LogisticRegressionClassifier,
-    "mlp": MLPClassifierWrapper,
+    "mlp": MLPProteinClassifier,
     "rf": RandomForestClassifierWrapper,
 }
 

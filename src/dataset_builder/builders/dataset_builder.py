@@ -8,7 +8,7 @@ import numpy as np
 
 from src.dataset_builder.label_loader import LabelLoader
 from src.input.protein_loader import ProteinLoader
-from src.dataset_builder.splits.models import SplitStrategy
+from src.dataset_builder.splits.strategies import SplitStrategy
 
 
 @dataclass
