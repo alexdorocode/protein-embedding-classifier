@@ -1,7 +1,7 @@
 """
 Predictor Module
 
-Handles single predictions using trained models.
+Handles single and batch predictions using trained models.
 
 Author: Protein Embedding Classifier Team
 Version: 1.0
@@ -10,7 +10,7 @@ Date: 2026-08-03
 
 import numpy as np
 import pandas as pd
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, Union, List
 import logging
 
 logger = logging.getLogger(__name__)
@@ -133,7 +133,10 @@ class BatchPredictor:
         for i in range(0, len(data_list), self.batch_size):
             batch = data_list[i:i + self.batch_size]
             batch_result = self.predictor.predict(batch, **kwargs)
-            results.extend(batch_result)
+            if isinstance(batch_result, np.ndarray):
+                results.extend(batch_result.tolist())
+            else:
+                results.extend(batch_result)
         
         return results
     
@@ -153,6 +156,9 @@ class BatchPredictor:
         for i in range(0, len(data_list), self.batch_size):
             batch = data_list[i:i + self.batch_size]
             batch_result = self.predictor.predict_proba(batch, **kwargs)
-            results.extend(batch_result)
+            if isinstance(batch_result, np.ndarray):
+                results.extend(batch_result.tolist())
+            else:
+                results.extend(batch_result)
         
         return results

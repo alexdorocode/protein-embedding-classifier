@@ -8,6 +8,8 @@ Version: 1.0
 Date: 2026-08-03
 """
 
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -181,3 +183,21 @@ class Plotter:
         
         plt.tight_layout()
         return fig
+    
+    def save_figure(self, fig: plt.Figure, path: str, **kwargs) -> None:
+        """
+        Save a figure to file.
+        
+        Args:
+            fig: Matplotlib figure
+            path: Path to save
+            **kwargs: Additional arguments for savefig
+        """
+        default_kwargs = {
+            'dpi': 300,
+            'bbox_inches': 'tight',
+            'format': 'png'
+        }
+        default_kwargs.update(kwargs)
+        fig.savefig(path, **default_kwargs)
+        plt.close(fig)

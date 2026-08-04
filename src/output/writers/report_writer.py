@@ -11,7 +11,6 @@ Date: 2026-08-03
 from pathlib import Path
 from typing import Optional, Dict, Any
 import logging
-import json
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +35,7 @@ class ReportWriter:
             output_path: Path to save report (optional)
             
         Returns:
-            Path to generated report
+            Path to generated report or report string
         """
         if template == 'default':
             report = self._generate_default_report(results)
@@ -120,31 +119,34 @@ class ReportWriter:
         Returns:
             Path to saved HTML report
         """
-        import markdown
-        
-        md_report = self.generate(results, template)
-        html_report = markdown.markdown(md_report)
-        
-        output_path = Path(output_path)
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>PEC Experiment Report</title>
-                <style>
-                    body {{ font-family: Arial, sans-serif; margin: 40px; }}
-                    h1, h2, h3 {{ color: #333; }}
-                    table {{ border-collapse: collapse; width: 100%; }}
-                    th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
-                    th {{ background-color: #f2f2f2; }}
-                </style>
-            </head>
-            <body>
-                {html_report}
-            </body>
-            </html>
-            """)
-        
-        logger.info(f"HTML report written to: {output_path}")
-        return str(output_path)
+        try:
+            import markdown
+            md_report = self.generate(results, template)
+            html_report = markdown.markdown(md_report)
+            
+            output_path = Path(output_path)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>PEC Experiment Report</title>
+                    <style>
+                        body {{ font-family: Arial, sans-serif; margin: 40px; }}
+                        h1, h2, h3 {{ color: #333; }}
+                        table {{ border-collapse: collapse; width: 100%; }}
+                        th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+                        th {{ background-color: #f2f2f2; }}
+                    </style>
+                </head>
+                <body>
+                    {html_report}
+                </body>
+                </html>
+                """)
+            
+            logger.info(f"HTML report written to: {output_path}")
+            return str(output_path)
+        except ImportError:
+            logger.warning("markdown module not available, saving as text")
+            return self.generate(results, template, output_path)

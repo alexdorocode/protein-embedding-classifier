@@ -9,7 +9,7 @@ Date: 2026-08-03
 """
 
 import numpy as np
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 import logging
 
 logger = logging.getLogger(__name__)
@@ -66,12 +66,6 @@ class EmbeddingSaliency:
         # In practice, you would use the model's gradient
         
         # For demonstration, we'll create a mock saliency map
-        # In a real implementation, you would:
-        # 1. Set requires_grad=True for embeddings
-        # 2. Forward pass through model
-        # 3. Backward pass to get gradients
-        # 4. Extract gradients as saliency
-        
         saliency_maps = []
         for emb in embeddings:
             # Mock saliency: random values for demonstration
@@ -98,8 +92,6 @@ class EmbeddingSaliency:
             Dictionary with integrated gradients
         """
         # Simplified implementation
-        # In practice, this would integrate gradients along a path from baseline to input
-        
         baseline = np.zeros_like(embeddings)
         saliency_maps = []
         

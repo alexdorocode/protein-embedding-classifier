@@ -35,7 +35,7 @@ def predict(model: any, data: any, **kwargs) -> any:
         **kwargs: Additional prediction arguments
         
     Returns:
-        Prediction results
+        Prediction result
     """
     predictor = Predictor(model)
     return predictor.predict(data, **kwargs)

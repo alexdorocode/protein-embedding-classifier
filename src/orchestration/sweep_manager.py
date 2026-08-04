@@ -37,7 +37,7 @@ class SweepManager:
         Returns:
             List of sweep results
         """
-        from .runner import ExperimentRunner
+        from .experiment_runner import ExperimentRunner
         
         experiment_name = sweep_config.get('experiment')
         param_grid = sweep_config.get('parameters', {})

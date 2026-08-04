@@ -16,11 +16,13 @@ Date: 2026-08-03
 
 from .feature_importance import FeatureImportance
 from .embedding_saliency import EmbeddingSaliency
+from .visualization.plotter import Plotter
 
 # Public API
 __all__ = [
     'FeatureImportance',
     'EmbeddingSaliency',
+    'Plotter',
     'explain',
     'visualize',
 ]
@@ -65,6 +67,5 @@ def visualize(explanation: any, visualization_type: str = 'bar', **kwargs) -> an
     Returns:
         Visualization (plot, figure, etc.)
     """
-    from .visualization.plotter import Plotter
     plotter = Plotter()
     return plotter.plot(explanation, visualization_type, **kwargs)

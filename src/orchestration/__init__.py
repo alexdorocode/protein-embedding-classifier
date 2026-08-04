@@ -14,14 +14,12 @@ Version: 1.0
 Date: 2026-08-03
 """
 
-from .experiment_definitions import ExperimentDefinitions
-from .runner import ExperimentRunner
+from .experiment_runner import ExperimentRunner
 from .sweep_manager import SweepManager
-from .benchmark import BenchmarkManager
+from .benchmark_manager import BenchmarkManager
 
 # Public API
 __all__ = [
-    'ExperimentDefinitions',
     'ExperimentRunner',
     'SweepManager',
     'BenchmarkManager',

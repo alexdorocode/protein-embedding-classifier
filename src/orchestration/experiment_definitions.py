@@ -45,8 +45,8 @@ class ExperimentDefinitions:
             dataset='20260803_0258_7672b947',
             model='mlp',
             training={
-                'epochs': 100,
-                'batch_size': 32,
+                'hidden_size': [128, 64],
+                'dropout': 0.2,
                 'learning_rate': 0.001,
             },
             evaluation={
@@ -62,29 +62,12 @@ class ExperimentDefinitions:
             dataset='20260803_0304_a68aa0bb',
             model='mlp',
             training={
-                'epochs': 100,
-                'batch_size': 32,
+                'hidden_size': [128, 64],
+                'dropout': 0.2,
                 'learning_rate': 0.001,
             },
             evaluation={
                 'test_size': 0.2,
-                'random_state': 42,
-            }
-        )
-        
-        # Cross-species experiment
-        self.experiments['cross_species'] = ExperimentConfig(
-            name='cross_species',
-            description='Train on model organisms, test on humans',
-            dataset='20260803_0304_a68aa0bb',
-            model='mlp',
-            training={
-                'epochs': 100,
-                'batch_size': 32,
-                'learning_rate': 0.001,
-            },
-            evaluation={
-                'test_dataset': '20260803_0258_7672b947',
                 'random_state': 42,
             }
         )
@@ -94,7 +77,7 @@ class ExperimentDefinitions:
             name='humans_rf',
             description='Train Random Forest on humans dataset',
             dataset='20260803_0258_7672b947',
-            model='random_forest',
+            model='rf',
             training={
                 'n_estimators': 100,
                 'max_depth': None,
