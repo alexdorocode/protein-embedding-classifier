@@ -1,15 +1,15 @@
-"""
-Splits Module
+from src.dataset_builder.splits.base import SplitStrategy
+from src.dataset_builder.splits.cross_validation import CrossValidationSplit
+from src.dataset_builder.splits.independent import IndependentValidationTrainTestSplit
+from src.dataset_builder.splits.zero_shot_csv import ZeroShotCSVSplit
+from src.dataset_builder.splits.zero_shot_organism import ZeroShotOrganismSplit
+from src.dataset_builder.splits.zero_shot_random import ZeroShotRandomSplit
 
-Responsible for creating split artifacts with leakage guards.
-
-Key Classes:
-- SplitStrategy: Abstract base class for split strategies
-- GroupByTargetSplitStrategy: Groups by target_id to prevent leakage
-- SplitManifest: Canonical split manifest
-"""
-
-from src.dataset_builder.splits.models import SplitManifest
-from src.dataset_builder.splits.strategies import SplitStrategy, GroupByTargetSplitStrategy
-
-__all__ = ["SplitStrategy", "GroupByTargetSplitStrategy", "SplitManifest"]
+__all__ = [
+    "SplitStrategy",
+    "CrossValidationSplit",
+    "IndependentValidationTrainTestSplit",
+    "ZeroShotCSVSplit",
+    "ZeroShotOrganismSplit",
+    "ZeroShotRandomSplit",
+]
