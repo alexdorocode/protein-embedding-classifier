@@ -6,8 +6,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import SVC
 
-from protein_embedding_classifier.core.training.model_factory import ModelFactory
-from protein_embedding_classifier.core.training.torch_wrapper import TorchTrainingWrapper
+from src.training.training.model_factory import ModelFactory
+from src.training.training.torch_wrapper import TorchTrainingWrapper
 
 
 def test_model_factory_lr():

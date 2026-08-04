@@ -1,8 +1,8 @@
 import numpy as np
 from sqlalchemy import text
 
-from protein_embedding_classifier.core.db import load_db_config, create_engine_from_config
-from protein_embedding_classifier.core.embeddings import EmbeddingStore
+from src.training.db import load_db_config, create_engine_from_config
+from src.training.embeddings import EmbeddingStore
 
 
 def test_embedding_store_shapes_for_all_models():

@@ -12,9 +12,9 @@ from dataclasses import field
 import logging
 from datetime import datetime
 
-from pec.dataset.input.models import UniverseRecord
-from pec.dataset.policies.models import DatasetPolicy
-from pec.dataset.generator.models import (
+from src.dataset_builder.input.models import UniverseRecord
+from src.dataset_builder.policies.models import DatasetPolicy
+from src.dataset_builder.generator.models import (
     DatasetVariant,
     AssignmentRecord,
     VariantManifest,

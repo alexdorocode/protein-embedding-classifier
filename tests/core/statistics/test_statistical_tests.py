@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from protein_embedding_classifier.core.statistics.friedman_test import run_friedman_test
-from protein_embedding_classifier.core.statistics.nemenyi_test import run_nemenyi_posthoc
-from protein_embedding_classifier.core.statistics.ranking_utils import (
+from src.training.statistics.friedman_test import run_friedman_test
+from src.training.statistics.nemenyi_test import run_nemenyi_posthoc
+from src.training.statistics.ranking_utils import (
     build_score_matrix,
     compute_average_ranks,
     compute_rank_matrix,

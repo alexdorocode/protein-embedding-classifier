@@ -1,8 +1,8 @@
 import numpy as np
 import pytest
 
-from protein_embedding_classifier.core.embedding_loading import EmbeddingBundle
-from protein_embedding_classifier.core.training.training_service import TrainingService
+from src.training.embedding_loading import EmbeddingBundle
+from src.training.training.training_service import TrainingService
 
 
 def _binary_bundle(n_train: int = 40, n_val: int = 16, n_features: int = 12) -> EmbeddingBundle:
@@ -97,7 +97,7 @@ def test_each_classifier_trains(model_type: str, model_params: dict):
     if model_type == "MLP":
         pytest.importorskip("torch")
         try:
-            from protein_embedding_classifier.classifiers.mlp_protein_classifier import MLPProteinClassifier  # noqa: F401
+            from src.training.models.mlp_protein_classifier import MLPProteinClassifier  # noqa: F401
         except Exception as exc:  # pragma: no cover
             pytest.skip(f"MLP dependencies unavailable: {exc}")
 
@@ -151,7 +151,7 @@ def test_each_classifier_trains_across_all_embedding_views(model_type: str, mode
     if model_type == "MLP":
         pytest.importorskip("torch")
         try:
-            from protein_embedding_classifier.classifiers.mlp_protein_classifier import MLPProteinClassifier  # noqa: F401
+            from src.training.models.mlp_protein_classifier import MLPProteinClassifier  # noqa: F401
         except Exception as exc:  # pragma: no cover
             pytest.skip(f"MLP dependencies unavailable: {exc}")
 

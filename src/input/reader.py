@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, TextIO
 import logging
 
-from pec.dataset.input.models import UniverseRecord, PoolConstraints, PoolMetadata
+from src.dataset_builder.models import UniverseRecord, PoolConstraints, PoolMetadata
 
 
 class UniverseReader:

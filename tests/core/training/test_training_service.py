@@ -2,8 +2,8 @@ import numpy as np
 import pytest
 from sklearn.preprocessing import StandardScaler
 
-from protein_embedding_classifier.core.embedding_loading import EmbeddingBundle
-from protein_embedding_classifier.core.training.training_service import TrainingService
+from src.training.embedding_loading import EmbeddingBundle
+from src.training.training.training_service import TrainingService
 
 
 class DummyModel:
@@ -391,7 +391,7 @@ def test_training_service_xgb_encodes_string_labels(monkeypatch):
 def test_torch_wrapper_batch_norm_avoids_singleton_batch(monkeypatch):
     torch = pytest.importorskip("torch")
 
-    from protein_embedding_classifier.core.training.torch_wrapper import TorchTrainingWrapper
+    from src.training.training.torch_wrapper import TorchTrainingWrapper
 
     original_loader = torch.utils.data.DataLoader
     captured: dict[str, object] = {}

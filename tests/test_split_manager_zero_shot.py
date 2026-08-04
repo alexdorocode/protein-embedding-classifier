@@ -4,7 +4,7 @@ import csv
 
 import pytest
 
-from protein_embedding_classifier.data.splits.independent import IndependentValidationTrainTestSplit
+from src.dataset_builder.splits.independent import IndependentValidationTrainTestSplit
 
 
 def _write_split_csv(path, rows):

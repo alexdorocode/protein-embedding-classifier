@@ -1,12 +1,12 @@
 import numpy as np
 import pytest
 
-from protein_embedding_classifier.core.embedding_loading import (
+from src.training.embedding_loading import (
     EmbeddingBundle,
     GOEmbeddingLoader,
     LayerAggregationStrategy,
 )
-from protein_embedding_classifier.data.dataset_builder import DatasetBundle
+from src.dataset_builder.dataset_builder import DatasetBundle
 
 
 def _sample_layered_embeddings():

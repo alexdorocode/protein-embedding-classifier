@@ -1,5 +1,5 @@
 # manual_wandb_check.py
-from protein_embedding_classifier.core.tracking import WandBTracker
+from src.training.tracking import WandBTracker
 
 tracker = WandBTracker(
     project="pec_develop",

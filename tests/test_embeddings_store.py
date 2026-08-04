@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from protein_embedding_classifier.core.embeddings import EmbeddingStore
+from src.training.embeddings import EmbeddingStore
 
 
 def test_get_uses_cache_and_db_once(monkeypatch):

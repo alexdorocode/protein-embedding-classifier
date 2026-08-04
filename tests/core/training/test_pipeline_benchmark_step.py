@@ -8,8 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
-from protein_embedding_classifier.core.embedding_loading import EmbeddingBundle
-from protein_embedding_classifier.core.pipeline import Pipeline
+from src.training.embedding_loading import EmbeddingBundle
+from src.training.pipeline import Pipeline
 
 
 class DummyPredictProbaModel:

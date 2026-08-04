@@ -1,6 +1,6 @@
 import pandas as pd
 
-from protein_embedding_classifier.data.label_loader import LabelLoader
+from src.dataset_builder.label_loader import LabelLoader
 
 
 def test_label_loader_collapses_singleton_duplicate_labels(tmp_path):

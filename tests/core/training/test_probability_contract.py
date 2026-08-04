@@ -1,10 +1,10 @@
 import numpy as np
 import pytest
 
-from protein_embedding_classifier.core.decision.decision_policy import decide
-from protein_embedding_classifier.core.embedding_loading import EmbeddingBundle
-from protein_embedding_classifier.core.probability.probability_adapter import ProbabilityAdapter
-from protein_embedding_classifier.core.training.training_service import TrainingService
+from src.training.decision.decision_policy import decide
+from src.training.embedding_loading import EmbeddingBundle
+from src.training.probability.probability_adapter import ProbabilityAdapter
+from src.training.training.training_service import TrainingService
 
 
 def test_probability_adapter_binary_shapes_to_n_by_2():
