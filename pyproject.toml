@@ -24,7 +24,7 @@ torch = "^2.10.0"
 pytest = "^8.3.5"
 
 [tool.pytest.ini_options]
-pythonpath = [".", "src", "protein_embedding_classifier"]
+pythonpath = [".", "src", "protein_embedding_classifier", "pec"]
 testpaths = ["tests"]
 
 [tool.poetry.scripts]
